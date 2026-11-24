@@ -1,0 +1,24 @@
+{
+  "_说明": "飞意QQ 运行配置。server 控制监听地址与端口，upload 控制聊天单文件大小，drive 独立控制公共盘/个人盘单文件大小；修改后重启服务生效。",
+  "server": {
+    "host": "0.0.0.0",
+    "port": 5222
+  },
+  "upload": {
+    "internal_max_mb": 20,
+    "external_max_mb": 1024,
+    "force_scope": null,
+    "internal_hosts": ["localhost", "127.0.0.1"],
+    "external_hosts": [],
+    "internal_ip_prefixes": [
+      "192.168."
+    ]
+  },
+  "drive": {
+    "_说明": "单位 MB。public/private_max_mb：null 跟随 upload 的内外网限制，数字为独立上限。个人盘再按内外网分别配置，0 表示禁止上传（下载不受影响）。",
+    "public_max_mb": 4096,
+    "private_max_mb": 20,
+    "private_internal_max_mb": 10,
+    "private_external_max_mb": 1024
+  }
+}

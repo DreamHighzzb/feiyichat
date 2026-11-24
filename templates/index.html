@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>飞意QQ</title>
+<link rel="stylesheet" href="/static/app.css?v={{ asset_ver.css }}">
+<script src="/static/socket.io.min.js"></script>
+</head>
+<body>
+
+<div id="login">
+  <div class="login-card">
+    <svg class="brand-logo" viewBox="0 0 300 150" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="飞意QQ">
+      <defs>
+        <g id="wing">
+          <path d="M150 78 C 178 62 210 44 238 30 C 222 54 190 74 156 84 Z" fill="#0b8fdb"/>
+          <path d="M155 85 C 183 76 211 62 235 49 C 221 69 191 84 158 91 Z" fill="#12b7f5"/>
+          <path d="M159 93 C 181 89 201 80 219 69 C 207 83 183 94 161 97 Z" fill="#6fd2f9"/>
+        </g>
+      </defs>
+      <use href="#wing"/>
+      <use href="#wing" transform="translate(300,0) scale(-1,1)"/>
+      <circle cx="150" cy="86" r="6" fill="#0b8fdb"/>
+      <text x="150" y="132" text-anchor="middle" font-family="'Microsoft YaHei','PingFang SC',sans-serif" font-size="34" font-weight="700" letter-spacing="1" fill="#23303c">飞意<tspan fill="#12b7f5">QQ</tspan></text>
+    </svg>
+    <p>输入姓名和密码，开始聊天</p>
+    <input id="nick-input" maxlength="20" placeholder="姓名 / 账号" autocomplete="username">
+    <input id="pass-input" type="password" maxlength="64" placeholder="登录密码" autocomplete="current-password">
+    <button id="join-btn" class="primary">登录</button>
+    <div id="login-err" class="login-err"></div>
+    <div class="login-tip">首次启动输入姓名和密码创建管理员账号，之后由管理员在「成员管理」中添加成员</div>
+  </div>
+</div>
+
+<div id="app">
+  <div id="titlebar">
+    <div class="brand">飞意QQ <small>快乐工作，轻松聊天</small></div>
+    <div class="spacer"></div>
+    <input id="top-search" class="search-mini" placeholder="搜索同事 / 群聊">
+    <div id="me-menu">
+      <div id="me-avatar-top" class="avatar-sm row-avatar">🙂</div>
+      <span id="me-nick-top"></span>
+    </div>
+  </div>
+
+  <div id="workbench">
+    <nav id="rail">
+      <div id="rail-avatar" class="me-avatar" title="我的资料"><i class="ico i-grid"></i></div>
+      <button class="rail-btn active" data-view="chats"><i class="ico i-message"></i><span>消息</span><i class="dot" id="rail-badge" style="display:none">0</i></button>
+      <button class="rail-btn" data-view="contacts"><i class="ico i-users"></i><span>联系人</span><i class="dot" id="rail-badge-contacts" style="display:none">0</i></button>
+      <button class="rail-btn" data-view="groups"><i class="ico i-group"></i><span>群聊</span><i class="dot" id="rail-badge-groups" style="display:none">0</i></button>
+      <button class="rail-btn" data-view="public-drive"><i class="ico i-cloud"></i><span>公共盘</span></button>
+      <button class="rail-btn" data-view="private-drive"><i class="ico i-user"></i><span>个人盘</span></button>
+      <button class="rail-btn" data-view="members" id="rail-members" style="display:none"><i class="ico i-shield"></i><span>成员管理</span></button>
+      <div class="grow"></div>
+      <button class="rail-btn" data-view="settings"><i class="ico i-settings"></i><span>设置</span></button>
+    </nav>
+
+    <section id="list-panel">
+      <div id="list-head"><h2 id="list-title">消息</h2><div id="list-actions"></div></div>
+      <div id="list-search-wrap"><input id="list-search" placeholder="搜索"></div>
+      <div id="list-scroll"></div>
+    </section>
+
+    <section id="chat-panel">
+      <div id="chat-header"></div>
+      <div id="chat-main">
+        <div id="chat-center">
+          <div id="chat-body">
+            <div id="messages"></div>
+            <div id="typing-hint">对方正在输入…</div>
+          </div>
+          <div id="composer">
+            <div id="pending-bar"></div>
+            <div id="quote-bar">
+              <div class="q-body">回复 <b id="quote-nick"></b><span class="q-text" id="quote-text"></span></div>
+              <button class="q-close" id="quote-close" title="取消引用"><i class="ico i-x"></i></button>
+            </div>
+            <div id="toolbar">
+              <button id="emoji-btn" class="tool-btn" title="表情"><i class="ico i-mood"></i></button>
+              <button id="at-btn" class="tool-btn" title="@ 群成员" aria-label="@ 群成员"><span class="at-sym">@</span></button>
+              <button id="file-btn" class="tool-btn" title="发送文件" aria-label="发送文件"><i class="ico i-paperclip"></i></button>
+              <input type="file" id="file-input" multiple hidden>
+              <span id="upload-hint" style="font-size:11px;color:var(--muted)">可拖入文件 / 粘贴截图</span>
+            </div>
+            <textarea id="input" placeholder="输入消息，@ 提及群成员，Enter 发送"></textarea>
+            <div id="send-row"><span class="hint">聊天内容仅保存在本机服务</span><button id="send"><i class="ico i-send"></i>发送</button></div>
+            <div id="emoji-panel">
+              <div id="emoji-tabs">
+                <button class="active" data-tab="classic">经典表情</button>
+                <button data-tab="unicode">Emoji</button>
+              </div>
+              <div id="grid-classic" class="emoji-grid"></div>
+              <div id="grid-unicode" class="emoji-grid hidden"></div>
+            </div>
+            <div id="mention-panel" class="hidden">
+              <div class="mp-head">选择要 @ 的成员 <span>↑↓ 选择 · Enter 确认 · Esc 取消</span></div>
+              <div id="mention-list"></div>
+            </div>
+          </div>
+        </div>
+        <aside id="group-panel" class="hidden">
+          <div class="gp-head"><i class="ico i-group"></i><b>群成员</b><span id="group-count">0</span><div class="grow"></div><button class="icon-btn" id="group-panel-close" title="收起成员列表"><i class="ico i-x"></i></button></div>
+          <input id="group-search" class="gp-search" placeholder="搜索群成员">
+          <div id="group-members"></div>
+        </aside>
+      </div>
+    </section>
+
+    <section id="drive-panel">
+      <div id="drive-head">
+        <div class="drive-title">
+          <span class="drive-badge"><i class="ico i-cloud" id="drive-icon"></i></span>
+          <div><b id="drive-name">公共盘</b><small id="drive-sub">公司成员共享的文件</small></div>
+        </div>
+        <div class="drive-tools">
+          <select id="drive-member" title="查看成员个人盘" aria-label="查看成员个人盘"></select>
+          <input id="drive-search" placeholder="搜索当前目录">
+          <button id="drive-newfolder" class="btn"><i class="ico i-folder-plus"></i>新建文件夹</button>
+          <button id="drive-upload" class="btn primary"><i class="ico i-upload"></i>上传文件</button>
+          <input type="file" id="drive-file" multiple hidden>
+        </div>
+      </div>
+      <div id="drive-path"></div>
+      <div id="drive-table-head">
+        <span>名称</span><span>大小</span><span>上传者</span><span>修改时间</span><span>操作</span>
+      </div>
+      <div id="drive-list"></div>
+      <div id="drive-status"><span id="drive-limit"></span><span id="drive-progress"></span></div>
+    </section>
+  </div>
+</div>
+
+<div id="modal-root"><div id="modal-mask"></div><div id="modal-box" class="modal"></div></div>
+<div id="toast"></div>
+<div id="desk-notify" title="点击查看消息"></div>
+
+<script src="/static/app.js?v={{ asset_ver.js }}"></script>
+</body>
+</html>
