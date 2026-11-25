@@ -159,6 +159,9 @@ button { cursor: pointer; }
 .rail-btn .dot {
   position: absolute; top: 6px; right: 8px; min-width: 16px; height: 16px; padding: 0 4px;
   border-radius: 8px; background: var(--red); color: #fff; font-size: 10px; line-height: 16px;
+  /* 数字在徽标内水平居中：setDot 用 display:block，故用 text-align 而非 flex */
+  display: block; text-align: center; vertical-align: middle;
+  white-space: nowrap; font-style: normal; box-sizing: border-box;
 }
 #rail .grow { flex: 1; }
 

@@ -2214,22 +2214,40 @@ def uploaded_file(filename):
         _diag('download-denied', channel='attachment', filename=safe_path,
               scope=upload_scope(), allowed=False, ip=request_ip(), reason=tip)
         return jsonify({'ok': False, 'error': tip}), 403
-    # 审核拦截：待审核/被拒绝的文件不允许下载（含内联预览）
-    # 用规范化后的路径算 key，堵住 ./ ../ 等变形绕过
-    key = review_key_upload(safe_path)
+    # 先定位文件真实落点，再按「实际目录」反推规范审核 key。
+    # 关键：不能用请求里的 safe_path 直接拼 key —— 请求 `zzb_x.png`（无前缀）时
+    # 会拼出 upload:zzb_x.png（无记录->默认放行），但文件其实在 uploads/in/ 下，
+    # 于是待审文件被绕过下载。必须按命中的目录还原成 in/xxx 或 out/xxx 的规范 key。
+    # 新文件在 in/out 子目录；旧文件在根目录（无前缀，保持兼容）。
+    found = None          # (base, rel_path, key_prefix)
+    if '/' in safe_path:
+        # 请求带 in/ 或 out/ 前缀：只允许到对应子目录取，key 前缀即请求前缀
+        prefix = safe_path.split('/', 1)[0]  # in 或 out
+        base = UPLOAD_IN_DIR if prefix == 'in' else UPLOAD_OUT_DIR
+        rel = safe_path.split('/', 1)[1]
+        if os.path.isfile(os.path.join(base, rel)):
+            found = (base, rel, prefix + '/')
+    else:
+        # 无前缀请求：先查根目录的历史文件；为兼容旧客户端也接受 in/out 里同名新文件，
+        # 但无论命中哪里，审核 key 都按真实目录还原，杜绝「无前缀绕过」。
+        for base, prefix in ((UPLOAD_DIR, ''), (UPLOAD_IN_DIR, 'in/'), (UPLOAD_OUT_DIR, 'out/')):
+            if os.path.isfile(os.path.join(base, safe_path)):
+                found = (base, safe_path, prefix)
+                break
+    if not found:
+        return ('', 404)
+    base, rel, key_prefix = found
+
+    # 审核拦截：一律用文件真实目录对应的规范 key 校验（与上传时一致）
+    key = review_key_upload(key_prefix + rel)
     rstatus = review_status(key)
     if rstatus != 'approved':
         diag_msg = '文件待管理员审核' if rstatus == 'pending' else '文件未通过审核'
         _diag('download-denied', channel='review', filename=safe_path,
-              scope=upload_scope(), status=rstatus, ip=request_ip(), reason=diag_msg)
+              key=key, scope=upload_scope(), status=rstatus, ip=request_ip(), reason=diag_msg)
         return jsonify({'ok': False, 'error': diag_msg}), 403
-    # 新文件按内外网落在 in/out 子目录；旧文件仍在根目录，保持兼容。
-    for base in (UPLOAD_IN_DIR, UPLOAD_OUT_DIR, UPLOAD_DIR):
-        if os.path.isfile(os.path.join(base, safe_path)):
-            # 历史遗留的危险文件也强制下载，杜绝同源内联执行（存储型 XSS）
-            return send_from_directory(base, safe_path,
-                                       as_attachment=is_dangerous_name(safe_path))
-    return ('', 404)
+    # 历史遗留的危险文件也强制下载，杜绝同源内联执行（存储型 XSS）
+    return send_from_directory(base, rel, as_attachment=is_dangerous_name(rel))
 
 
 # ---------------------------------------------------------------------------
@@ -2357,9 +2375,12 @@ def api_drive():
         folder = ''
     folders, files = drive_children(st, folder)
     # 注入实时审核状态（管理员可能已通过/拒绝，需每次读取最新值）
+    # 审核 key 在上传时按「文件真实 owner」生成（见 api_drive_upload），这里必须用
+    # 同一个 owner，不能用 owner_uid（公共盘 owner_uid 是当前访问者，个人盘是目标成员）。
+    # 否则别人查看公共盘时 key 拼错 -> 查不到记录 -> review_status 默认放行 -> 绕过审核。
     for item in files:
         item['reviewStatus'] = review_status(
-            review_key_drive(scope, owner_uid, item.get('id', '')))
+            review_key_drive(scope, item.get('owner') or owner_uid, item.get('id', '')))
     total = sum(int(f.get('size') or 0) for f in (st.get('files') or {}).values())
     viewing_other = scope == 'private' and owner_uid != uid
     return api_ok(scope=scope, folder=folder, path=drive_folder_chain(st, folder),
@@ -2491,8 +2512,14 @@ def api_drive_download():
     meta = (st.get('files') or {}).get(fid)
     if not meta:
         return api_fail('文件不存在或已删除', 404)
-    rstatus = review_status(review_key_drive(scope, owner_uid, fid))
+    # 审核 key 必须与上传时一致：按文件真实 owner 生成，而不是访问者 owner_uid。
+    # 公共盘 owner_uid=当前访问者，用它拼 key 会查不到审核记录而默认放行，绕过审核。
+    file_owner = meta.get('owner') or owner_uid
+    rstatus = review_status(review_key_drive(scope, file_owner, fid))
     if rstatus != 'approved':
+        _diag('download-denied', channel='review', uid=uid, owner=file_owner,
+              scope=scope, fid=fid, status=rstatus, ip=request_ip(),
+              reason='文件待审核或未通过')
         msg = '文件待管理员审核，暂不可下载' if rstatus == 'pending' else '文件未通过审核'
         return api_fail(msg, 403)
     path = os.path.join(drive_disk_dir(scope, owner_uid), fid)
