@@ -44,6 +44,10 @@ _EXTRA_PATHS = {
     'arrow-left': '<path d="M5 12l14 0"/><path d="M5 12l6 6"/><path d="M5 12l6 -6"/>',
     'cloud': '<path d="M6.657 18c-2.572 0 -4.657 -2.007 -4.657 -4.483c0 -2.475 2.085 -4.482 4.657 -4.482c.393 -1.762 1.794 -3.2 3.675 -3.773c1.88 -.572 3.956 -.193 5.444 1c1.488 1.19 2.162 3.007 1.77 4.769h.99c1.913 0 3.464 1.56 3.464 3.486c0 1.927 -1.551 3.487 -3.465 3.487h-11.878"/>',
     'user': '<path d="M8 7a4 4 0 1 0 8 0a4 4 0 0 0 -8 0"/><path d="M6 21v-2a4 4 0 0 1 4 -4h4a4 4 0 0 1 4 4v2"/>',
+    # 工单 —— 剪贴板勾选
+    'ticket': ('<path d="M9 5h6a2 2 0 0 1 2 2v1h1a2 2 0 0 1 2 2v9a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2v-9a2 2 0 0 1 2 -2h1v-1a2 2 0 0 1 2 -2"/>'
+               '<path d="M9 5a2 2 0 0 1 2 -2h2a2 2 0 0 1 2 2v1H9z"/>'
+               '<path d="M9 14l2 2l4 -4"/>'),
 }
 _ICON_TPL = ('<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" '
              'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" '
@@ -64,6 +68,57 @@ _FULL_SVGS = {
     'dot-red': ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
                 '<circle cx="32" cy="32" r="26" fill="#ff2d2d" stroke="#fff" stroke-width="4"/></svg>'),
 }
+
+# 设置页菜单图标：蓝底圆角方块 + 白色线性图形（与截图同风格）。
+# 图形采用 Tabler Icons（MIT）的路径思路，内嵌服务端，离线可用。
+_SET_STROKE = ('fill="none" stroke="#fff" stroke-width="2.4" '
+               'stroke-linecap="round" stroke-linejoin="round"')
+_SET_BG = '<rect width="64" height="64" rx="16" fill="#12b7f5"/>'
+
+
+def _set_svg(body):
+    return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">' +
+            _SET_BG + '<g transform="translate(14 14) scale(1.5)" ' +
+            _SET_STROKE + '>' + body + '</g></svg>')
+
+
+_FULL_SVGS.update({
+    # 个人资料 —— 手机/设备
+    'set-profile': _set_svg('<rect x="7" y="3" width="10" height="18" rx="2"/>'
+                            '<path d="M11 18h2"/>'),
+    # 修改密码 —— 钥匙
+    'set-password': _set_svg('<circle cx="12" cy="7" r="4"/>'
+                             '<path d="M12 11v9"/><path d="M12 16h3"/><path d="M12 19h2"/>'),
+    # 桌面通知 —— 铃铛
+    'set-notify': _set_svg('<path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/>'
+                           '<path d="M10 21h4"/>'),
+    # 消息提示音 —— 音符
+    'set-sound': _set_svg('<path d="M10 18V5l9-2v13"/>'
+                          '<ellipse cx="7" cy="18" rx="3" ry="2.5"/>'
+                          '<ellipse cx="16" cy="16" rx="3" ry="2.5"/>'),
+    # 外观主题 —— 调色板（带斜杠，对应截图）
+    'set-theme': _set_svg('<path d="M12 3a9 9 0 1 0 0 18c1 0 2-1 2-2s-1-2-2-2h-1a2 2 0 0 1 0-4h5a5 5 0 0 0 5-5c0-3.9-4-5-9-5z"/>'
+                          '<circle cx="7.5" cy="11" r=".8" fill="#fff"/>'
+                          '<circle cx="10" cy="7" r=".8" fill="#fff"/>'
+                          '<circle cx="15" cy="7.5" r=".8" fill="#fff"/>'
+                          '<path d="M3 3l18 18"/>'),
+    # 退出登录 —— 门
+    'set-logout': _set_svg('<rect x="6" y="3" width="10" height="18" rx="1"/>'
+                           '<path d="M13 12h1"/><path d="M18 9l3 3-3 3"/><path d="M21 12h-6"/>'),
+    # 诊断日志 —— 列表（管理员设置页入口）
+    'set-diag': _set_svg('<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/>'
+                         '<circle cx="4" cy="6" r=".8" fill="#fff"/>'
+                         '<circle cx="4" cy="12" r=".8" fill="#fff"/>'
+                         '<circle cx="4" cy="18" r=".8" fill="#fff"/>'),
+    # 权限与限制 —— 滑杆
+    'set-permission': _set_svg('<path d="M4 7h16"/><path d="M4 17h16"/>'
+                               '<circle cx="9" cy="7" r="2.2" fill="#1e88c7" stroke="#fff"/>'
+                               '<circle cx="15" cy="17" r="2.2" fill="#1e88c7" stroke="#fff"/>'),
+    # 文件审核 —— 勾选清单
+    'set-review': _set_svg('<rect x="5" y="4" width="14" height="16" rx="2"/>'
+                           '<path d="M8 9l1.5 1.5L12 8"/><path d="M8 15l1.5 1.5L12 14"/>'
+                           '<path d="M14 9h3"/><path d="M14 15h3"/>'),
+})
 for _n, _s in _FULL_SVGS.items():
     ICONS[_n] = _s
 

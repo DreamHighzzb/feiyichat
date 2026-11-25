@@ -50,18 +50,30 @@
       <button class="rail-btn active" data-view="chats"><i class="ico i-message"></i><span>消息</span><i class="dot" id="rail-badge" style="display:none">0</i></button>
       <button class="rail-btn" data-view="contacts"><i class="ico i-users"></i><span>联系人</span><i class="dot" id="rail-badge-contacts" style="display:none">0</i></button>
       <button class="rail-btn" data-view="groups"><i class="ico i-group"></i><span>群聊</span><i class="dot" id="rail-badge-groups" style="display:none">0</i></button>
+      <button class="rail-btn" data-view="tickets"><i class="ico i-ticket"></i><span>工单</span><i class="dot" id="rail-badge-tickets" style="display:none">0</i></button>
       <button class="rail-btn" data-view="public-drive"><i class="ico i-cloud"></i><span>公共盘</span></button>
       <button class="rail-btn" data-view="private-drive"><i class="ico i-user"></i><span>个人盘</span></button>
       <button class="rail-btn" data-view="members" id="rail-members" style="display:none"><i class="ico i-shield"></i><span>成员管理</span></button>
       <div class="grow"></div>
-      <button class="rail-btn" data-view="settings"><i class="ico i-settings"></i><span>设置</span></button>
+      <button class="rail-btn" data-view="settings"><i class="ico i-settings"></i><span>设置</span><i class="dot" id="rail-badge-review" style="display:none">0</i></button>
     </nav>
 
     <section id="list-panel">
       <div id="list-head"><h2 id="list-title">消息</h2><div id="list-actions"></div></div>
       <div id="list-search-wrap"><input id="list-search" placeholder="搜索"></div>
+      <div id="ticket-filters">
+        <select id="tkf-status" title="按状态筛选"><option value="">全部状态</option></select>
+        <select id="tkf-member" title="按成员筛选"><option value="">全部</option><option value="__self__">自己</option></select>
+        <select id="tkf-sort" title="排序方式">
+          <option value="created-desc">创建时间（最新）</option>
+          <option value="created-asc">创建时间（最早）</option>
+          <option value="updated-desc">更新时间（最新）</option>
+        </select>
+      </div>
       <div id="list-scroll"></div>
     </section>
+
+    <section id="ticket-panel"></section>
 
     <section id="chat-panel">
       <div id="chat-header"></div>
@@ -81,8 +93,10 @@
               <button id="emoji-btn" class="tool-btn" title="表情"><i class="ico i-mood"></i></button>
               <button id="at-btn" class="tool-btn" title="@ 群成员" aria-label="@ 群成员"><span class="at-sym">@</span></button>
               <button id="file-btn" class="tool-btn" title="发送文件" aria-label="发送文件"><i class="ico i-paperclip"></i></button>
+              <button id="shot-btn" class="tool-btn" title="屏幕截图 (Ctrl+Alt+A)" aria-label="屏幕截图"><i class="ico i-scissors"></i></button>
+              <button id="rec-btn" class="tool-btn" title="屏幕录制 (Ctrl+Alt+S)" aria-label="屏幕录制"><i class="ico i-video"></i></button>
               <input type="file" id="file-input" multiple hidden>
-              <span id="upload-hint" style="font-size:11px;color:var(--muted)">可拖入文件 / 粘贴截图</span>
+              <span id="upload-hint" style="font-size:11px;color:var(--muted)">可拖入文件 / 粘贴截图 · 截图 Ctrl+Alt+A · 录屏 Ctrl+Alt+S</span>
             </div>
             <textarea id="input" placeholder="输入消息，@ 提及群成员，Enter 发送"></textarea>
             <div id="send-row"><span class="hint">聊天内容仅保存在本机服务</span><button id="send"><i class="ico i-send"></i>发送</button></div>
@@ -130,6 +144,39 @@
       <div id="drive-status"><span id="drive-limit"></span><span id="drive-progress"></span></div>
     </section>
   </div>
+</div>
+
+<!-- 屏幕截图：冻结画面 + 框选裁剪 + 标注 -->
+<div id="shot-layer" class="hidden">
+  <canvas id="shot-base"></canvas>
+  <canvas id="shot-draw"></canvas>
+  <div id="shot-selection"><b id="shot-size"></b><i class="sh sh-nw"></i><i class="sh sh-ne"></i><i class="sh sh-sw"></i><i class="sh sh-se"></i></div>
+  <div id="shot-tools">
+    <button type="button" data-tool="select" class="active">框选</button>
+    <button type="button" data-tool="pen">画笔</button>
+    <button type="button" data-tool="rect">矩形</button>
+    <button type="button" data-tool="text">文字</button>
+    <input type="color" id="shot-color" value="#ff3b30" title="标注颜色">
+    <button type="button" id="shot-undo">撤销</button>
+    <button type="button" id="shot-clear">清空</button>
+    <span class="sp"></span>
+    <button type="button" id="shot-reselect">重选</button>
+    <button type="button" id="shot-copy">复制</button>
+    <button type="button" id="shot-save">另存</button>
+    <button type="button" id="shot-send" class="primary">发送</button>
+    <button type="button" id="shot-cancel">取消</button>
+  </div>
+  <div id="shot-tip">在画面上拖动即可任意框选（含窗口） · 框选后选工具可标注 · Esc 取消</div>
+  <input id="shot-text-input" class="hidden" maxlength="80" placeholder="输入文字后回车">
+</div>
+
+<!-- 屏幕录制：浮动预览 + 计时控制 -->
+<div id="rec-bar" class="hidden">
+  <video id="rec-preview" autoplay muted playsinline></video>
+  <div class="rec-info"><span class="rec-dot"></span><b id="rec-time">00:00</b><small id="rec-size">录制中</small></div>
+  <button type="button" id="rec-pause">暂停</button>
+  <button type="button" id="rec-stop" class="primary">完成并发送</button>
+  <button type="button" id="rec-cancel">取消</button>
 </div>
 
 <div id="modal-root"><div id="modal-mask"></div><div id="modal-box" class="modal"></div></div>

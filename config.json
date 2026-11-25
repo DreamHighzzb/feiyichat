@@ -1,24 +1,46 @@
 {
-  "_说明": "飞意QQ 运行配置。server 控制监听地址与端口，upload 控制聊天单文件大小，drive 独立控制公共盘/个人盘单文件大小；修改后重启服务生效。",
   "server": {
     "host": "0.0.0.0",
     "port": 5222
   },
   "upload": {
-    "internal_max_mb": 20,
-    "external_max_mb": 1024,
+    "internal_max_mb": 10.0,
+    "external_max_mb": 1024.0,
     "force_scope": null,
-    "internal_hosts": ["localhost", "127.0.0.1"],
+    "internal_hosts": [
+      "localhost",
+      "127.0.0.1"
+    ],
     "external_hosts": [],
     "internal_ip_prefixes": [
+      "127.",
       "192.168."
-    ]
+    ],
+    "trusted_proxy_prefixes": [],
+    "_安全说明": "X-Forwarded-For 默认忽略，防外网伪造内网IP绕过下载限制。仅当部署在反向代理后时，填入代理机IP前缀才会解析XFF。"
   },
   "drive": {
-    "_说明": "单位 MB。public/private_max_mb：null 跟随 upload 的内外网限制，数字为独立上限。个人盘再按内外网分别配置，0 表示禁止上传（下载不受影响）。",
     "public_max_mb": 4096,
+    "public_internal_max_mb": 512.0,
+    "public_external_max_mb": 4096.0,
     "private_max_mb": 20,
-    "private_internal_max_mb": 10,
-    "private_external_max_mb": 1024
-  }
+    "private_internal_max_mb": 10.0,
+    "private_external_max_mb": 1024.0,
+    "_说明": "公共盘/个人盘单文件上传上限（MB），0 表示禁止上传。保留 public_max_mb/private_max_mb 作为旧版兜底。"
+  },
+  "download": {
+    "internal_enabled": true,
+    "external_enabled": true,
+    "drive_public_internal_enabled": true,
+    "drive_public_external_enabled": false,
+    "drive_private_internal_enabled": true,
+    "drive_private_external_enabled": false,
+    "_说明": "聊天附件下载开关，内外网独立；0/false 关闭。"
+  },
+  "review": {
+    "enabled": true,
+    "max_mb": 10.0,
+    "_说明": "上传审核。enabled=false 关闭；enabled=true 时，超过 max_mb 的文件需管理员审核通过才可下载，max_mb=0 表示所有文件都要审核。"
+  },
+  "_说明": "飞意QQ 运行配置。server 控制监听地址与端口；upload/download 控制聊天附件的上传大小与下载开关；review 控制上传审核；drive 控制公共盘/个人盘上传大小；download.drive_* 控制公共盘/个人盘下载开关。所有大小单位 MB，0 表示禁止上传/仅能发文本。管理员可在设置-管理设置中修改，修改后即时生效并自动保存本文件。"
 }

@@ -42,6 +42,7 @@ const state = {
   data: { friends: [], groups: [], requests: {in: [], out: []}, chats: [], unread: {} },
   histories: {}, pending: [], sending: false, search: '', quote: null,
   uploadLimit: {maxBytes: 20 * 1024 * 1024, text: '20 MB', scope: 'internal'},
+  download: {allowed: true, tip: ''},
   driveLimit: {
     public: {maxBytes: 20 * 1024 * 1024, text: '20 MB'},
     private: {maxBytes: 20 * 1024 * 1024, text: '20 MB'},
@@ -51,6 +52,13 @@ const state = {
   mention: {open: false, start: 0, query: '', items: [], index: 0},
   drive: {scope: 'public', folder: '', path: [], folders: [], files: [], total: 0, q: '', busy: false,
           target: '', members: [], viewingOther: false, ownerNick: ''},
+  tickets: [], ticketUnread: [], ticketCurrent: null,
+  ticketStatusText: {}, ticketPriorityText: {}, ticketStatuses: [], ticketPriorities: [],
+  // 工单列表筛选：状态、成员、排序；成员为空表示全部
+  ticketFilter: {status: '', member: '', sort: 'created-desc'},
+  // 设置页签：basic / admin（仅管理员可见 admin）
+  settingsTab: 'basic',
+  review: {enabled: false, maxMB: 10, pending: 0},
 };
 let socket = null;
 let typingTimer = null, lastTyping = 0, toastTimer = null;
@@ -272,6 +280,47 @@ function desktopNotify(m) {
   }
   if (!document.hidden) showDeskBubble(title, body || '发来一条消息', m.ch);
 }
+/* 工单指派提醒：谁指派的、哪张工单，点击直达。
+   与聊天提醒一致：优先系统通知（常驻），否则页面内气泡；始终红闪 + 提示音。 */
+function openTicketFromNotify(tid) {
+  window.focus();
+  switchView('tickets');
+  if (tid) {
+    state.ticketCurrent = tid;
+    loadTickets().then(() => { renderTicketList(); renderTicketDetail(); });
+  }
+}
+function ticketAssignNotify(d) {
+  const who = d.actorNick || '同事';
+  const title = '【工单指派】' + who + ' 指派了一张工单给你';
+  const body = d.title || (d.msg || '').slice(0, 120);
+  playNotifySound(true);
+  startFlash('工单指派');
+  if (!notifyEnabled) return;
+  if ('Notification' in window && Notification.permission === 'granted') {
+    const logo = document.querySelector('.logo-bubble');
+    try {
+      const n = new Notification(title, {
+        body: body || '点击查看工单详情',
+        tag: 'feiyi-ticket-' + d.id,
+        icon: logo ? logo.src : undefined,
+        requireInteraction: true,
+        renotify: true,
+        silent: true,
+      });
+      n.onclick = () => { openTicketFromNotify(d.id); n.close(); };
+      return;
+    } catch (e) {}
+  }
+  if (!document.hidden) {
+    const el = $('desk-notify');
+    el.innerHTML = '<b>' + esc(title) + '</b><span>' + esc(body || '点击查看工单详情') + '</span>';
+    el.classList.add('show');
+    el.onclick = () => { el.classList.remove('show'); openTicketFromNotify(d.id); };
+    clearTimeout(deskNotifyTimer);
+    deskNotifyTimer = setTimeout(() => el.classList.remove('show'), 15000);
+  }
+}
 window.addEventListener('focus', () => {
   stopFlash();
   const el = $('desk-notify'); if (el) el.classList.remove('show');
@@ -389,11 +438,30 @@ async function api(path, options) {
 
 function loadUploadConfig() {
   api('/api/upload_config').then(d => {
+    const rawMax = Number(d.maxBytes);
     state.uploadLimit = {
-      maxBytes: Number(d.maxBytes) || 20 * 1024 * 1024,
+      maxBytes: isNaN(rawMax) ? 20 * 1024 * 1024 : rawMax,
       text: d.text || '20 MB',
       scope: d.scope || 'internal',
     };
+    state.download = {
+      allowed: d.download ? d.download.allowed !== false : true,
+      tip: (d.download && d.download.tip) || '当前环境已关闭下载权限',
+    };
+    const prevPending = Number(state.review && state.review.pending) || 0;
+    const rv = d.review || {};
+    state.review = {
+      enabled: !!rv.enabled,
+      maxMB: rv.maxMB !== undefined ? Number(rv.maxMB) || 0 : 10,
+      // 后端只对管理员下发 pending，普通成员恒为 0
+      pending: Number(rv.pending) || 0,
+    };
+    // 待审数量变化：刷新页签红点；管理员新收到待审时给一次提示
+    updateRailBadge();
+    if (state.view === 'settings') renderList();
+    if (state.review.pending > 0 && state.review.pending > prevPending) {
+      toast('有 ' + state.review.pending + ' 个文件待审核，请到 设置 → 管理设置 处理');
+    }
     ['public', 'private'].forEach(k => {
       const cfg = (d.drive || {})[k] || {};
       const raw = cfg.maxBytes;
@@ -401,10 +469,13 @@ function loadUploadConfig() {
         maxBytes: (raw === null || raw === undefined || isNaN(Number(raw)))
           ? state.uploadLimit.maxBytes : Number(raw),
         text: cfg.text || state.uploadLimit.text,
+        download: cfg.download || {allowed: true, tip: ''},
       };
     });
     const hint = $('upload-hint');
-    if (hint) hint.textContent = '单文件 ≤ ' + state.uploadLimit.text + ' · 可拖入/粘贴';
+    if (hint) hint.textContent = state.uploadLimit.maxBytes === 0
+      ? '管理员已关闭附件上传 · 只能发文字和表情'
+      : '单文件 ≤ ' + state.uploadLimit.text + ' · 可拖入/粘贴';
     if (state.view === 'public-drive' || state.view === 'private-drive') renderDrive();
   }).catch(() => {
     const hint = $('upload-hint');
@@ -454,6 +525,8 @@ function connect() {
     $('app').classList.add('show');
     $('join-btn').disabled = false;
     loadUploadConfig();
+    // 登录后立即拉取工单未读，让工单页签红点直接显示（不必等点进页签）
+    loadTickets();
   });
   socket.on('join_error', d => {
     $('login').style.display = 'flex'; $('app').classList.remove('show');
@@ -501,6 +574,50 @@ function connect() {
     if (d.scope === 'public' && state.view === 'public-drive') loadDrive();
     if (d.scope === 'private' && state.view === 'private-drive') loadDrive();
   });
+  socket.on('ticket', d => {
+    if (!d) return;
+    // 变更推送：刷新列表 + 提示 + 红闪（多端同步也需要刷新）
+    loadTickets();
+    if (d.msg) toast(d.msg);
+    if (d.action) startFlash('工单' + d.action);
+    // 指派给「我」的强提醒：系统通知常驻 + 提示音 + 红闪，点击直达工单
+    if (d.assignTo && d.assignTo === state.uid && d.actor && d.actor !== state.uid) {
+      ticketAssignNotify(d);
+    }
+  });
+  socket.on('ticket_unread', d => {
+    if (!d) return;
+    state.ticketUnread = d.ids || [];
+    updateRailBadge();
+    if (state.view === 'tickets') renderTicketList();
+  });
+  // 管理员改了配置：所有端重新拉取限制/开关，即时生效
+  socket.on('config_changed', () => {
+    loadUploadConfig();
+    if (state.view === 'public-drive' || state.view === 'private-drive') loadDrive();
+    if (state.view === 'settings') renderList();
+  });
+  // 管理员收到新文件待审核提醒
+  socket.on('review_pending', d => {
+    if (!d) return;
+    const prev = Number(state.review && state.review.pending) || 0;
+    const now = Number(d.count) || 0;
+    state.review.pending = now;
+    updateRailBadge();
+    if (state.me && state.me.isAdmin) {
+      // 只在数量增加时提醒「有新文件」；审核完成后的数量回落不再误报
+      if (now > prev) {
+        toast('有新文件待审核（' + now + '）' + (d.name ? '：' + d.name : ''));
+      }
+      if (state.view === 'settings' && state.settingsTab === 'admin') renderList();
+    }
+  });
+  // 上传者收到审核结果
+  socket.on('review_result', d => {
+    if (!d) return;
+    toast(d.msg || (d.approved ? '文件已通过审核' : '文件未通过审核'));
+    if (state.view === 'public-drive' || state.view === 'private-drive') loadDrive();
+  });
   socket.on('typing', d => {
     if (d.ch !== state.current || d.uid === state.uid) return;
     $('typing-hint').style.display = 'block';
@@ -541,6 +658,9 @@ function updateRailBadge() {
   setDot('rail-badge', all);
   setDot('rail-badge-contacts', reqN);
   setDot('rail-badge-groups', groupN);
+  setDot('rail-badge-tickets', (state.ticketUnread || []).length);
+  // 管理员的设置页签红点 = 待审核文件数（普通成员后端不下发，恒为 0）
+  setDot('rail-badge-review', Number(state.review && state.review.pending) || 0);
 }
 /* 只有正在看该会话、且窗口可见时才真正标已读；
    连续消息合并到一次请求，避免刷接口。 */
@@ -560,6 +680,7 @@ document.querySelectorAll('.rail-btn').forEach(btn => {
 function switchView(view) {
   stopFlash();
   state.view = view;
+  document.body.classList.toggle('view-tickets', view === 'tickets');
   document.querySelectorAll('.rail-btn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
   $('list-search').value = ''; state.search = '';
   const isDrive = view === 'public-drive' || view === 'private-drive';
@@ -581,6 +702,13 @@ function switchView(view) {
     loadDrive();
     return;
   }
+  if (view === 'tickets') {
+    state.current = null; clearQuote();
+    renderList();
+    loadTickets();
+    renderTicketDetail();
+    return;
+  }
   if (view !== 'chats') { state.current = null; clearQuote(); }
   renderList(); renderChat();
 }
@@ -591,13 +719,14 @@ function actionButton(icon, title, fn) {
 }
 function renderList() {
   const titles = {chats: '消息', contacts: '联系人', groups: '群聊', members: '成员管理',
-                  settings: '设置', 'public-drive': '公共盘', 'private-drive': '个人盘'};
+                  settings: '设置', 'public-drive': '公共盘', 'private-drive': '个人盘', tickets: '工单'};
   $('list-title').textContent = titles[state.view];
-  $('list-search').placeholder = state.view === 'chats' ? '搜索会话' : state.view === 'contacts' ? '搜索同事' : state.view === 'members' ? '搜索成员' : '搜索群聊';
+  $('list-search').placeholder = state.view === 'chats' ? '搜索会话' : state.view === 'contacts' ? '搜索同事' : state.view === 'members' ? '搜索成员' : state.view === 'tickets' ? '搜索工单' : '搜索群聊';
   const actions = $('list-actions'); actions.innerHTML = '';
   if (state.view === 'chats' || state.view === 'contacts') actions.appendChild(actionButton('<i class="ico i-plus"></i>', '发起会话', openNewChat));
   if (state.view === 'groups') actions.appendChild(actionButton('<i class="ico i-plus"></i>', '创建群聊', openCreateGroup));
   if (state.view === 'members') actions.appendChild(actionButton('<i class="ico i-plus"></i>', '添加成员', openAddUser));
+  if (state.view === 'tickets') actions.appendChild(actionButton('<i class="ico i-plus"></i>', '创建工单', openCreateTicket));
   const q = state.search.trim().toLowerCase();
   const box = $('list-scroll'); box.innerHTML = '';
 
@@ -676,27 +805,50 @@ function renderList() {
       }
       box.appendChild(row);
     });
+  } else if (state.view === 'tickets') {
+    renderTicketListInto(box, q);
   } else if (state.view === 'settings') {
-    const items = [
-      ['个人资料', '修改昵称、头像和签名'],
-      ['修改密码', '输入原密码后设置新密码'],
-      ['桌面通知', notifyEnabled ? '已开启：系统通知常驻右下角，需点击关闭' : '已关闭：点击开启'],
-      ['消息提示音', notifySound ? '已开启：来消息响一声，@你响双音' : '已关闭：点击开启'],
-      ['外观主题', '切换亮色 / 暗色'],
-      ['退出登录', '保留账号数据，下次输入密码继续'],
-    ];
-    items.forEach((it, i) => {
+    const isAdmin = !!(state.me && state.me.isAdmin);
+    // 页签栏：基本设置 / 管理设置（仅管理员）
+    const tabs = document.createElement('div'); tabs.className = 'settings-tabs';
+    const pendingN = Number(state.review && state.review.pending) || 0;
+    const badgeN = pendingN > 99 ? '99+' : pendingN;
+    [['basic', '基本设置']].concat(isAdmin ? [['admin', '管理设置']] : []).forEach(([key, label]) => {
+      const b = document.createElement('button');
+      b.className = 'settings-tab' + (state.settingsTab === key ? ' active' : '');
+      b.innerHTML = esc(label) + (key === 'admin' && pendingN ? '<i class="tab-dot">' + badgeN + '</i>' : '');
+      b.onclick = () => { if (state.settingsTab !== key) { state.settingsTab = key; renderList(); } };
+      tabs.appendChild(b);
+    });
+    box.appendChild(tabs);
+
+    let items;
+    if (state.settingsTab === 'admin' && isAdmin) {
+      items = [
+        ['set-permission', '权限与限制', '聊天附件/公共盘/个人盘上传大小、内外网下载开关、上传审核', () => showAdminConfig()],
+        ['set-review', '文件审核', state.review.enabled
+          ? ('已开启 · 超过 ' + state.review.maxMB + ' MB 需审核 · 待审 ' + (state.review.pending || 0))
+          : '已关闭', () => showReviewList()],
+        ['set-diag', '诊断日志', '查看内外网判定与下载拦截记录', () => showDiagLog()],
+      ];
+    } else {
+      items = [
+        ['set-profile', '个人资料', '修改昵称、头像和签名', () => showSettings()],
+        ['set-password', '修改密码', '输入原密码后设置新密码', () => showChangePassword()],
+        ['set-notify', '桌面通知', notifyEnabled ? '已开启：系统通知常驻右下角，需点击关闭' : '已关闭：点击开启', () => toggleNotify()],
+        ['set-sound', '消息提示音', notifySound ? '已开启：来消息响一声，@你响双音' : '已关闭：点击开启', () => toggleNotifySound()],
+        ['set-theme', '外观主题', '切换亮色 / 暗色', () => toggleTheme()],
+        ['set-logout', '退出登录', '保留账号数据，下次输入密码继续', () => logout()],
+      ];
+    }
+    items.forEach(it => {
       const row = document.createElement('div'); row.className = 'row';
-      row.innerHTML = '<div class="avatar" style="background:var(--accent)">' + ['🙂','🔑','🔔','🎵','🎨','🚪'][i] + '</div>' +
-        '<div class="info"><div class="line1"><span class="name">' + it[0] + '</span></div><div class="preview">' + it[1] + '</div></div>';
-      row.onclick = () => {
-        if (i === 0) showSettings();
-        if (i === 1) showChangePassword();
-        if (i === 2) toggleNotify();
-        if (i === 3) toggleNotifySound();
-        if (i === 4) toggleTheme();
-        if (i === 5) logout();
-      };
+      // 文件审核项有待审时，行内加红点徽标
+      const dot = (it[0] === 'set-review' && pendingN)
+        ? '<i class="dot" style="position:static;display:inline-block;vertical-align:middle;margin-left:6px">' + badgeN + '</i>' : '';
+      row.innerHTML = '<div class="avatar"><img src="/icon/' + it[0] + '.svg" alt=""></div>' +
+        '<div class="info"><div class="line1"><span class="name">' + it[1] + '</span>' + dot + '</div><div class="preview">' + esc(it[2]) + '</div></div>';
+      row.onclick = it[3];
       box.appendChild(row);
     });
   }
@@ -706,6 +858,401 @@ function sectionLabel(text, linkText, linkFn) {
   el.innerHTML = '<span>' + esc(text) + '</span>' + (linkText ? '<span class="link">' + esc(linkText) + '</span>' : '');
   if (linkFn) el.querySelector('.link').onclick = linkFn;
   return el;
+}
+
+/* ======================= 工单 ======================= */
+/* 需求正文富文本：白名单清洗 + 图片内联上传。
+   存储的是清洗后的安全 HTML（img 仅允许本站 /uploads/ 路径），展示前再清洗一次，
+   防止历史数据或手工构造内容带来 XSS。 */
+const TK_ALLOWED_TAGS = {DIV:1, P:1, BR:1, SPAN:1, B:1, STRONG:1, I:1, EM:1, U:1, A:1, IMG:1, UL:1, OL:1, LI:1};
+function sanitizeTicketHtml(html) {
+  let doc;
+  try { doc = new DOMParser().parseFromString('<div id="__root">' + (html || '') + '</div>', 'text/html'); }
+  catch (e) { return ''; }
+  const root = doc.getElementById('__root');
+  if (!root) return '';
+  const out = document.createElement('div');
+  const walk = (src, dst) => {
+    for (const node of Array.from(src.childNodes)) {
+      if (node.nodeType === 3) { dst.appendChild(document.createTextNode(node.nodeValue)); continue; }
+      if (node.nodeType !== 1) continue;
+      const tag = node.tagName.toUpperCase();
+      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'IFRAME' || tag === 'OBJECT') continue;
+      if (tag === 'BR' || tag === 'DIV' || tag === 'P') {
+        if (tag === 'BR') { dst.appendChild(document.createElement('br')); continue; }
+        // div/p 展开为换行分隔；若前一个已是 br 则不重复追加，保证反复编辑幂等
+        const last = dst.lastChild;
+        if (dst.childNodes.length && !(last && last.nodeName === 'BR')) {
+          dst.appendChild(document.createElement('br'));
+        }
+        walk(node, dst); continue;
+      }
+      if (!TK_ALLOWED_TAGS[tag]) { walk(node, dst); continue; }
+      const el = document.createElement(tag.toLowerCase());
+      if (tag === 'IMG') {
+        const u = (node.getAttribute('src') || '').trim();
+        // 只放行本站上传目录；禁止 data/javascript 等任何外部协议
+        if (/^\/uploads\/[^\s"'<>]+$/.test(u)) el.setAttribute('src', u);
+        else continue;
+        el.setAttribute('alt', (node.getAttribute('alt') || '图片').slice(0, 60));
+        dst.appendChild(el); continue;
+      }
+      if (tag === 'A') {
+        const href = (node.getAttribute('href') || '').trim();
+        if (/^https?:\/\/[^\s"'<>]+$/i.test(href)) {
+          el.setAttribute('href', href);
+          el.setAttribute('target', '_blank'); el.setAttribute('rel', 'noopener noreferrer');
+        }
+      }
+      walk(node, el);
+      dst.appendChild(el);
+    }
+  };
+  walk(root, out);
+  return out.innerHTML;
+}
+/* 编辑器：一个 contenteditable 正文 + 插入图片按钮 + 隐藏 file input */
+function tkEditorHTML(descHtml) {
+  return '<div class="tk-editor">' +
+    '<div class="tk-editor-bar"><button type="button" class="btn" id="tk-pic-btn">插入图片</button>' +
+    '<span class="tk-hint">可直接粘贴截图 · 图文混排</span>' +
+    '<input type="file" id="tk-pic-input" accept="image/*" hidden></div>' +
+    '<div class="tk-editor-body" id="tk-desc" contenteditable="true" data-ph="详细说明任务内容、交付要求等，可插入图片">' +
+    sanitizeTicketHtml(descHtml || '') + '</div></div>';
+}
+function readTkEditor() {
+  const el = $('tk-desc');
+  if (!el) return '';
+  // 把 contenteditable 里的 div/p 转成显式 br，统一存储格式
+  const html = sanitizeTicketHtml(el.innerHTML);
+  return html.length > TICKET_DESC_HTML_MAX ? html.slice(0, TICKET_DESC_HTML_MAX) : html;
+}
+const TICKET_DESC_HTML_MAX = 11000; // 给 HTML 标签留出余量（服务端按字符数算 12000）
+function insertHtmlAtCaret(html) {
+  const sel = window.getSelection();
+  if (!sel || !sel.rangeCount) return;
+  const range = sel.getRangeAt(0);
+  range.deleteContents();
+  const frag = range.createContextualFragment(html);
+  const last = frag.lastChild;
+  range.insertNode(frag);
+  if (last) { range.setStartAfter(last); range.collapse(true); sel.removeAllRanges(); sel.addRange(range); }
+}
+function tkInsertImage(file) {
+  if (!file || !/^image\//i.test(file.type || '')) { toast('请选择图片文件'); return; }
+  if (file.size > state.uploadLimit.maxBytes) return toast('图片超过 ' + state.uploadLimit.text);
+  uploadFile(file).then(info => {
+    const url = info && info.url;
+    if (!url) return toast('图片上传失败');
+    const el = $('tk-desc');
+    if (!el) return;
+    el.focus();
+    insertHtmlAtCaret('<img src="' + esc(url) + '" alt="图片"><br>');
+  }).catch(e => toast('图片上传失败：' + e.message));
+}
+function bindTkEditor() {
+  const input = $('tk-pic-input'), btn = $('tk-pic-btn'), body = $('tk-desc');
+  if (btn && input) btn.onclick = () => input.click();
+  if (input) input.onchange = () => {
+    if (input.files && input.files[0]) tkInsertImage(input.files[0]);
+    input.value = '';
+  };
+  if (body) {
+    if (!body.innerHTML.trim()) body.classList.add('empty');
+    body.addEventListener('input', () => body.classList.toggle('empty', !body.textContent.trim() && !body.querySelector('img')));
+    body.addEventListener('paste', e => {
+      const items = (e.clipboardData && e.clipboardData.items) || [];
+      for (const it of items) {
+        if (it.kind === 'file' && /^image\//i.test(it.type || '')) {
+          e.preventDefault(); tkInsertImage(it.getAsFile()); return;
+        }
+      }
+      // 纯文本粘贴：转义后按换行分段插入，避免粘贴 HTML 带入样式/脚本
+      const text = e.clipboardData && e.clipboardData.getData('text/plain');
+      if (text) {
+        e.preventDefault();
+        insertHtmlAtCaret(esc(text).replace(/\r?\n/g, '<br>'));
+      }
+    });
+  }
+}
+function tkStatusBadge(status) {
+  const text = (state.ticketStatusText[status]) || status || '';
+  return '<span class="tk-status tk-' + esc(status) + '">' + esc(text) + '</span>';
+}
+function loadTickets() {
+  if (!state.uid) return Promise.resolve();
+  return api('/api/tickets').then(d => {
+    state.tickets = d.tickets || [];
+    state.ticketUnread = d.unread || [];
+    state.ticketStatusText = d.statusText || {};
+    state.ticketPriorityText = d.priorityText || {};
+    state.ticketStatuses = d.statuses || [];
+    state.ticketPriorities = d.priorities || [];
+    updateRailBadge();
+    setupTicketFilters();
+    if (state.view === 'tickets') { renderTicketList(); renderTicketDetail(); }
+  }).catch(() => {});
+}
+function setupTicketFilters() {
+  const fs = $('tkf-status'), fm = $('tkf-member');
+  if (!fs || !fm) return;
+  const st = $('tkf-sort');
+  if (st) st.value = state.ticketFilter.sort;
+  // 状态选项（保留当前选择）
+  if (!fs.dataset.ready || fs.options.length <= 1) {
+    fs.innerHTML = '<option value="">全部状态</option>' + (state.ticketStatuses || []).map(s =>
+      '<option value="' + esc(s) + '">' + esc(state.ticketStatusText[s] || s) + '</option>').join('');
+    fs.dataset.ready = '1';
+  }
+  fs.value = state.ticketFilter.status;
+  // 成员筛选只给两个维度：全部 / 自己（自己的工单 = 我创建的或指派给我的）
+  fm.innerHTML = '<option value="">全部</option>' +
+    '<option value="' + esc(state.uid) + '">自己</option>';
+  // 切换账号后旧筛选值可能已失效，回退到「全部」
+  if (state.ticketFilter.member && state.ticketFilter.member !== state.uid) state.ticketFilter.member = '';
+  fm.value = state.ticketFilter.member;
+  if (!fs.dataset.bound) {
+    fs.onchange = () => { state.ticketFilter.status = fs.value; renderTicketList(); };
+    fm.onchange = () => { state.ticketFilter.member = fm.value; renderTicketList(); };
+    if (st) st.onchange = () => { state.ticketFilter.sort = st.value; renderTicketList(); };
+    fs.dataset.bound = '1';
+  }
+}
+function renderTicketList() {
+  const box = $('list-scroll');
+  if (!box) return;
+  box.innerHTML = '';
+  renderTicketListInto(box, state.search.trim().toLowerCase());
+}
+function renderTicketListInto(box, q) {
+  const f = state.ticketFilter || {};
+  let all = (state.tickets || []).filter(t => {
+    if (f.status && t.status !== f.status) return false;
+    if (f.member && t.creator !== f.member && t.assignee !== f.member) return false;
+    if (!q) return true;
+    return (t.title || '').toLowerCase().includes(q) ||
+      ((t.creatorInfo && t.creatorInfo.nick) || '').toLowerCase().includes(q) ||
+      ((t.assigneeInfo && t.assigneeInfo.nick) || '').toLowerCase().includes(q);
+  });
+  const sort = f.sort || 'created-desc';
+  const key = sort === 'created-asc' ? 'created' : sort === 'updated-desc' ? 'updated' : 'created';
+  const dir = sort === 'created-asc' ? 1 : -1;
+  all = all.slice().sort((a, b) => dir * ((a[key] || 0) - (b[key] || 0)));
+  const openN = all.filter(t => t.status === 'open' || t.status === 'doing').length;
+  box.appendChild(sectionLabel('工单 (' + all.length + ') · 进行中 ' + openN));
+  if (!all.length) {
+    box.innerHTML = '<div class="empty-hint">暂无工单<br>点右上角「+」创建并直派给同事</div>';
+    return;
+  }
+  const unread = state.ticketUnread || [];
+  all.forEach(t => {
+    const row = document.createElement('div');
+    row.className = 'row' + (state.ticketCurrent === t.id ? ' active' : '');
+    const prio = t.priority === 'high' ? '<span class="tk-prio-high">[高]</span> '
+                 : t.priority === 'low' ? '<span class="tk-prio-low">[低]</span> ' : '';
+    const isUnread = unread.includes(t.id);
+    row.innerHTML =
+      '<div class="avatar" style="background:var(--accent)"><i class="ico i-ticket"></i></div>' +
+      '<div class="info"><div class="line1"><span class="name">' + (isUnread ? '<b style="color:var(--accent)">● </b>' : '') + esc(t.title) + '</span>' +
+      '<span class="time">' + fmtTime(t.updated) + '</span></div>' +
+      '<div class="tk-row-preview">' + tkStatusBadge(t.status) +
+      '<span class="tk-preview-text">' + prio + '→ ' + esc((t.assigneeInfo && t.assigneeInfo.nick) || '未指派') + '</span></div></div>';
+    row.onclick = () => openTicket(t.id);
+    box.appendChild(row);
+  });
+}
+function openTicket(id) {
+  stopFlash();
+  state.ticketCurrent = id;
+  renderTicketList();
+  renderTicketDetail();
+  api('/api/ticket/read', {method: 'POST', body: {id}}).catch(() => {});
+  // 本地立即清掉该工单未读，体验更跟手
+  state.ticketUnread = (state.ticketUnread || []).filter(x => x !== id);
+  setDot('rail-badge-tickets', state.ticketUnread.length);
+}
+function renderTicketDetail() {
+  const panel = $('ticket-panel');
+  if (!panel) return;
+  const t = (state.tickets || []).find(x => x.id === state.ticketCurrent);
+  if (!t) {
+    panel.innerHTML = '<div class="tk-detail"><div class="tk-closed-banner" style="margin:auto;max-width:480px">' +
+      '选择一个工单查看详情<br><span style="font-size:11px">工单由创建者直派给同事，可跟踪进度与状态</span></div></div>';
+    return;
+  }
+  const closed = t.status === 'closed';
+  const tracks = t.tracks || [];
+  const typeText = {create: '创建', status: '状态', comment: '跟踪', close: '关闭', edit: '编辑'};
+  let timeline = '';
+  tracks.forEach(tr => {
+    const who = esc((tr.userInfo && tr.userInfo.nick) || tr.uid || '');
+    timeline += '<div class="tk-track tk-' + esc(tr.type || '') + '">' +
+      '<span class="tk-dot"></span>' +
+      '<div class="tk-track-head"><b>' + who + '</b>' +
+      '<span class="tk-type">' + esc(typeText[tr.type] || tr.type || '') + '</span>' +
+      '<span class="tk-ts">' + fmtFull(tr.ts) + '</span></div>' +
+      '<div class="tk-track-text">' + esc(tr.text || '') + '</div></div>';
+  });
+
+  // 操作区：状态推进/指派（管理员或当前被指派人）；编辑（创建者或管理员）；关闭/删除（创建者或管理员）
+  let statusSelect = '';
+  if (t.canManageAssign && !closed) {
+    const opts = (state.ticketStatuses || []).map(s =>
+      '<option value="' + esc(s) + '"' + (s === t.status ? ' selected' : '') + '>' +
+      esc(state.ticketStatusText[s] || s) + '</option>').join('');
+    statusSelect = '<label>状态</label><select id="tk-status-sel">' + opts + '</select>' +
+      '<button class="btn" id="tk-status-btn">更新状态</button>';
+  }
+  let manageBtns = '';
+  if (t.canEdit && !closed) manageBtns += '<button class="btn" id="tk-edit-btn">编辑工单</button>';
+  else if (t.canManageAssign && !closed) manageBtns += '<button class="btn" id="tk-reassign-btn">转派</button>';
+  if (t.canManage) {
+    if (!closed) manageBtns += '<button class="btn" id="tk-close-btn">关闭工单</button>';
+    manageBtns += '<button class="btn danger" id="tk-delete-btn">删除</button>';
+  }
+  const commentBox = (t.canTrack && !closed)
+    ? '<div class="tk-composer">' +
+        '<div class="tk-tools">' + statusSelect + '</div>' +
+        '<textarea id="tk-comment-input" placeholder="填写跟踪记录（进度、备注、处理结果…）"></textarea>' +
+        '<div class="tk-actions"><span class="tk-hint">' + (closed ? '工单已关闭' : 'Enter 发送 · Shift+Enter 换行') + '</span>' +
+        '<button class="btn primary" id="tk-comment-btn">添加跟踪</button>' + manageBtns + '</div>' +
+      '</div>'
+    : '<div class="tk-composer"><div class="tk-actions">' +
+        '<span class="tk-hint">' + (closed ? '工单已关闭' : '只读 · 仅创建人 / 被指派人 / 管理员可操作此工单') + '</span>' +
+        manageBtns + '</div></div>';
+
+  panel.innerHTML =
+    '<div class="tk-detail">' +
+      '<div class="tk-detail-head">' +
+        '<div class="tk-title-row">' + tkStatusBadge(t.status) +
+          '<h3>' + esc(t.title) + '</h3>' +
+          (t.priority === 'high' ? '<span class="tk-prio-high">高优先级</span>' : '') +
+        '</div>' +
+        '<div class="tk-meta">' +
+          '<span>创建：<b>' + esc((t.creatorInfo && t.creatorInfo.nick) || t.creator) + '</b></span>' +
+          '<span>指派：<b>' + esc((t.assigneeInfo && t.assigneeInfo.nick) || t.assignee) + '</b></span>' +
+          '<span>创建于 <b>' + fmtFull(t.created) + '</b></span>' +
+          (t.closedAt ? '<span>关闭于 <b>' + fmtFull(t.closedAt) + '</b></span>' : '') +
+        '</div>' +
+      '</div>' +
+      '<div class="tk-detail-body">' +
+        '<div class="tk-section-title">工单需求</div>' +
+        '<div class="tk-desc-box">' + (t.desc ? sanitizeTicketHtml(t.desc) : '<span style="color:var(--muted)">（未填写需求）</span>') + '</div>' +
+        '<div class="tk-section-title" style="margin-top:22px">跟踪记录 (' + tracks.length + ')</div>' +
+        '<div class="tk-timeline">' + timeline + '</div>' +
+      '</div>' +
+      commentBox +
+    '</div>';
+
+  const bind = (id, fn) => { const el = $(id); if (el) el.onclick = fn; };
+  bind('tk-comment-btn', () => submitTicketComment(t.id));
+  bind('tk-status-btn', () => {
+    const sel = $('tk-status-sel');
+    if (sel) updateTicketStatus(t.id, sel.value);
+  });
+  bind('tk-edit-btn', () => openEditTicket(t));
+  bind('tk-reassign-btn', () => openReassignTicket(t));
+  bind('tk-close-btn', () => confirmBox('关闭工单', '确定关闭「' + t.title + '」吗？关闭后不能继续跟踪。', () => closeTicket(t.id)));
+  bind('tk-delete-btn', () => confirmBox('删除工单', '确定删除「' + t.title + '」吗？此操作不可恢复。', () => deleteTicket(t.id)));
+  const input = $('tk-comment-input');
+  if (input) {
+    input.onkeydown = e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitTicketComment(t.id); }
+    };
+  }
+  panel.querySelectorAll('.tk-desc-box img').forEach(img => {
+    img.onclick = () => window.open(img.src, '_blank');
+  });
+}
+function memberOptions(selected) {
+  const members = (state.data.members || []).filter(m => m.uid !== state.uid || m.uid === selected);
+  return members.map(m =>
+    '<option value="' + esc(m.uid) + '"' + (m.uid === selected ? ' selected' : '') + '>' +
+    esc(m.nick) + (m.online ? '（在线）' : '') + '</option>').join('');
+}
+function openTicketForm(t) {
+  const editing = !!t;
+  // 编辑态：指派下拉仅管理员或当前被指派人可改；其他人只读展示当前指派
+  const canChangeAssignee = editing ? !!t.canManageAssign : true;
+  const assigneeField = canChangeAssignee
+    ? '<select id="tk-assignee">' + memberOptions(editing ? t.assignee : '') + '</select>'
+    : '<select id="tk-assignee" disabled>' + memberOptions(editing ? t.assignee : '') + '</select>' +
+      '<div class="tk-hint" style="margin-top:4px">只有管理员或当前被指派人可以修改指派</div>';
+  showModal(editing ? '编辑工单' : '创建工单',
+    '<div class="field"><label>工单标题</label><input id="tk-title" maxlength="120" placeholder="简要描述要处理的事项" value="' + esc(editing ? (t.title || '') : '') + '"></div>' +
+    '<div class="field"><label>指派给</label>' + assigneeField + '</div>' +
+    '<div class="field"><label>优先级</label><select id="tk-prio">' +
+      '<option value="normal"' + (!editing || t.priority === 'normal' ? ' selected' : '') + '>普通</option>' +
+      '<option value="high"' + (editing && t.priority === 'high' ? ' selected' : '') + '>高</option>' +
+      '<option value="low"' + (editing && t.priority === 'low' ? ' selected' : '') + '>低</option></select></div>' +
+    '<div class="field"><label>工单需求</label>' + tkEditorHTML(editing ? t.desc : '') + '</div>',
+    [{text: '取消', onClick: closeModal},
+     {text: editing ? '保存修改' : '创建并指派', cls: 'primary', onClick: async () => {
+       const title = $('tk-title').value.trim();
+       const assignee = $('tk-assignee').value;
+       const prio = $('tk-prio').value;
+       const desc = readTkEditor();
+       if (!title) return toast('请填写工单标题');
+       if (!assignee) return toast('请选择指派的成员');
+       try {
+         const r = await api(editing ? '/api/ticket/update' : '/api/ticket/create', {method: 'POST',
+           body: {id: editing ? t.id : undefined, title, assignee, priority: prio, desc}});
+         closeModal();
+         toast(editing ? '工单已更新' : '工单已创建并指派');
+         await loadTickets();
+         state.ticketCurrent = editing ? t.id : r.id;
+         setTimeout(() => { renderTicketList(); renderTicketDetail(); }, 50);
+       } catch (e) { toast(e.message); }
+     }}]);
+  bindTkEditor();
+}
+function openCreateTicket() { openTicketForm(null); }
+function openEditTicket(t) { openTicketForm(t); }
+function openReassignTicket(t) {
+  showModal('转派工单',
+    '<div class="field"><label>工单</label><div>' + esc(t.title) + '</div></div>' +
+    '<div class="field"><label>转派给</label><select id="tk-reassign-to">' +
+      memberOptions(t.assignee) + '</select></div>' +
+    '<div class="tk-hint">转派后新负责人会收到提醒</div>',
+    [{text: '取消', onClick: closeModal},
+     {text: '确认转派', cls: 'primary', onClick: async () => {
+       const assignee = $('tk-reassign-to').value;
+       if (!assignee) return toast('请选择成员');
+       if (assignee === t.assignee) return toast('负责人未变化');
+       try {
+         await api('/api/ticket/update', {method: 'POST', body: {
+           id: t.id, title: t.title, desc: t.desc || '', priority: t.priority || 'normal', assignee}});
+         closeModal(); toast('已转派');
+         await loadTickets();
+         renderTicketList(); renderTicketDetail();
+       } catch (e) { toast(e.message); }
+     }}]);
+}
+function submitTicketComment(id) {
+  const input = $('tk-comment-input');
+  const text = input ? input.value.trim() : '';
+  if (!text) return toast('请填写跟踪内容');
+  api('/api/ticket/comment', {method: 'POST', body: {id, text}}).then(() => {
+    loadTickets(); toast('已添加跟踪记录');
+  }).catch(e => toast(e.message));
+}
+function updateTicketStatus(id, status) {
+  if (!status) return;
+  api('/api/ticket/status', {method: 'POST', body: {id, status}}).then(() => {
+    loadTickets(); toast('状态已更新');
+  }).catch(e => toast(e.message));
+}
+function closeTicket(id) {
+  api('/api/ticket/close', {method: 'POST', body: {id}}).then(() => {
+    loadTickets(); toast('工单已关闭');
+  }).catch(e => toast(e.message));
+}
+function deleteTicket(id) {
+  api('/api/ticket/delete', {method: 'POST', body: {id}}).then(() => {
+    state.ticketCurrent = null;
+    loadTickets(); toast('工单已删除');
+  }).catch(e => toast(e.message));
 }
 $('list-search').addEventListener('input', e => { state.search = e.target.value; renderList(); });
 $('top-search').addEventListener('keydown', e => {
@@ -979,6 +1526,153 @@ function toggleTheme() {
   localStorage.setItem('feiyi_theme', next);
   toast(next === 'dark' ? '已切换到暗色主题' : '已切换到亮色主题');
 }
+/* ---------- 管理员：权限与限制配置 ---------- */
+function _cfgNumInput(id, label, hint) {
+  return '<div class="cfg-row"><label for="' + id + '">' + label + '</label>' +
+    '<input type="number" id="' + id + '" min="0" step="1" style="width:110px">' +
+    '<span class="cfg-hint">' + (hint || 'MB') + '</span></div>';
+}
+function _cfgBoolInput(id, label) {
+  return '<label class="cfg-check"><input type="checkbox" id="' + id + '"> ' + label + '</label>';
+}
+async function showAdminConfig() {
+  if (!state.me || !state.me.isAdmin) return toast('只有管理员可以设置');
+  const body = showModal('权限与限制', '<div class="login-tip">加载中…</div>', [
+    {text: '取消', onClick: closeModal},
+    {text: '保存', cls: 'primary', onClick: saveAdminConfig},
+  ]);
+  let cfg;
+  try {
+    const d = await api('/api/admin/config');
+    cfg = d.config || {};
+  } catch (e) {
+    body.innerHTML = '<div class="login-tip">加载失败：' + esc(e.message || e) + '</div>';
+    return;
+  }
+  const up = cfg.upload || {}, dl = cfg.download || {}, rv = cfg.review || {}, dr = cfg.drive || {};
+  const n = v => (v === null || v === undefined || v === '') ? '' : Number(v);
+  body.innerHTML =
+    '<div class="cfg-sec"><b>聊天附件</b><div class="cfg-note">填 0 = 该环境只能发送文字和表情，禁止上传文件</div>' +
+      _cfgNumInput('cfg-chat-in', '内网上传上限', 'MB · 0=禁传') +
+      _cfgNumInput('cfg-chat-out', '外网上传上限', 'MB · 0=禁传') +
+      '<div class="cfg-checks">' + _cfgBoolInput('cfg-dl-in', '允许内网下载附件') +
+      _cfgBoolInput('cfg-dl-out', '允许外网下载附件') + '</div></div>' +
+
+    '<div class="cfg-sec"><b>上传审核</b><div class="cfg-note">开启后，达到阈值的文件需管理员审核通过才可下载；阈值填 0 = 所有文件都要审核</div>' +
+      '<div class="cfg-checks">' + _cfgBoolInput('cfg-review-on', '开启上传审核') + '</div>' +
+      _cfgNumInput('cfg-review-max', '审核大小阈值', 'MB · 0=全部审核') + '</div>' +
+
+    '<div class="cfg-sec"><b>公共盘</b><div class="cfg-note">填 0 = 该环境禁止上传到公共盘</div>' +
+      _cfgNumInput('cfg-pub-in', '内网上传上限', 'MB · 0=禁传') +
+      _cfgNumInput('cfg-pub-out', '外网上传上限', 'MB · 0=禁传') +
+      '<div class="cfg-checks">' + _cfgBoolInput('cfg-pub-dl-in', '允许内网下载') +
+      _cfgBoolInput('cfg-pub-dl-out', '允许外网下载') + '</div></div>' +
+
+    '<div class="cfg-sec"><b>个人盘</b><div class="cfg-note">填 0 = 该环境禁止上传到个人盘</div>' +
+      _cfgNumInput('cfg-pri-in', '内网上传上限', 'MB · 0=禁传') +
+      _cfgNumInput('cfg-pri-out', '外网上传上限', 'MB · 0=禁传') +
+      '<div class="cfg-checks">' + _cfgBoolInput('cfg-pri-dl-in', '允许内网下载') +
+      _cfgBoolInput('cfg-pri-dl-out', '允许外网下载') + '</div></div>';
+
+  const set = (id, v) => { const el = $(id); if (el) el.value = n(v); };
+  const chk = (id, v) => { const el = $(id); if (el) el.checked = !!v; };
+  set('cfg-chat-in', up.internal_max_mb); set('cfg-chat-out', up.external_max_mb);
+  chk('cfg-dl-in', dl.internal_enabled); chk('cfg-dl-out', dl.external_enabled);
+  chk('cfg-review-on', rv.enabled); set('cfg-review-max', rv.max_mb);
+  set('cfg-pub-in', dr.public_internal_max_mb); set('cfg-pub-out', dr.public_external_max_mb);
+  set('cfg-pri-in', dr.private_internal_max_mb); set('cfg-pri-out', dr.private_external_max_mb);
+  chk('cfg-pub-dl-in', dl.drive_public_internal_enabled); chk('cfg-pub-dl-out', dl.drive_public_external_enabled);
+  chk('cfg-pri-dl-in', dl.drive_private_internal_enabled); chk('cfg-pri-dl-out', dl.drive_private_external_enabled);
+}
+async function saveAdminConfig() {
+  const val = id => { const el = $(id); return el ? el.value : ''; };
+  const num = id => { const v = parseFloat(val(id)); return isNaN(v) ? 0 : v; };
+  const on = id => { const el = $(id); return !!(el && el.checked); };
+  const config = {
+    upload: {internal_max_mb: num('cfg-chat-in'), external_max_mb: num('cfg-chat-out')},
+    download: {
+      internal_enabled: on('cfg-dl-in'), external_enabled: on('cfg-dl-out'),
+      drive_public_internal_enabled: on('cfg-pub-dl-in'), drive_public_external_enabled: on('cfg-pub-dl-out'),
+      drive_private_internal_enabled: on('cfg-pri-dl-in'), drive_private_external_enabled: on('cfg-pri-dl-out'),
+    },
+    review: {enabled: on('cfg-review-on'), max_mb: num('cfg-review-max')},
+    drive: {
+      public_internal_max_mb: num('cfg-pub-in'), public_external_max_mb: num('cfg-pub-out'),
+      private_internal_max_mb: num('cfg-pri-in'), private_external_max_mb: num('cfg-pri-out'),
+    },
+  };
+  try {
+    await api('/api/admin/config', {method: 'POST', body: {config}});
+    closeModal();
+    toast('设置已保存并即时生效');
+    loadUploadConfig();
+    if (state.view === 'settings') renderList();
+  } catch (e) { toast('保存失败：' + e.message); }
+}
+
+/* ---------- 管理员：上传审核列表 ---------- */
+async function showReviewList() {
+  if (!state.me || !state.me.isAdmin) return toast('只有管理员可以审核文件');
+  const body = showModal('文件审核', '<div class="login-tip">加载中…</div>', [
+    {text: '刷新', onClick: () => showReviewList()},
+    {text: '关闭', cls: 'primary', onClick: closeModal},
+  ]);
+  try {
+    const d = await api('/api/admin/review/list?status=pending');
+    state.review.pending = Number(d.pending) || 0;
+    updateRailBadge();
+    const rows = (d.files || []).map(f =>
+      '<div class="review-row"><div class="review-meta">' +
+        '<div class="review-name">' + esc(f.name || '未命名') + '</div>' +
+        '<div class="review-sub">' + esc(f.ownerNick || f.owner || '') + ' · ' + sizeText(f.size) +
+        ' · ' + esc(f.channel || '') + '</div></div>' +
+        '<button class="btn primary" data-act="approve" data-key="' + esc(f.key) + '">通过</button>' +
+        '<button class="btn danger" data-act="reject" data-key="' + esc(f.key) + '">拒绝</button></div>').join('');
+    body.innerHTML = '<div class="login-tip" style="margin-top:0">待审核 <b>' + (d.pending || 0) +
+      '</b> 个文件' + (d.enabled ? '' : '（审核当前未开启）') + '</div>' +
+      (rows || '<div class="login-tip">暂无待审核文件</div>');
+    body.querySelectorAll('.review-row button').forEach(b => {
+      b.onclick = async () => {
+        try {
+          await api('/api/admin/review/approve', {method: 'POST',
+            body: {key: b.dataset.key, action: b.dataset.act}});
+          toast(b.dataset.act === 'approve' ? '已通过审核' : '已拒绝');
+          showReviewList();
+          loadUploadConfig();
+        } catch (e) { toast(e.message); }
+      };
+    });
+  } catch (e) {
+    body.innerHTML = '<div class="login-tip">加载失败：' + esc(e.message || e) + '</div>';
+  }
+}
+
+/* ---------- 管理员诊断日志：内外网判定 / 下载拦截 ---------- */
+async function showDiagLog() {
+  const body = showModal('诊断日志', '<div class="login-tip">加载中…</div>', [
+    {text: '刷新', onClick: () => showDiagLog()},
+    {text: '关闭', cls: 'primary', onClick: closeModal},
+  ]);
+  try {
+    const d = await api('/api/diag');
+    const c = d.config || {}, cur = d.current || {};
+    const yn = v => (v === true || v === 'true') ? '开启' : '关闭';
+    const head =
+      '<div class="login-tip" style="margin-top:0">当前判定：<b>' + esc(cur.scope || '-') + '</b> · ' +
+      'IP <b>' + esc(cur.ip || '-') + '</b> · 下载<b>' + (cur.download_allowed ? '允许' : '禁止') + '</b>' +
+      (cur.xff ? '<br>X-Forwarded-For: ' + esc(cur.xff) : '') +
+      '<br>配置的内网前缀：' + esc((c.internal_ip_prefixes || []).join(', ')) +
+      ' · force_scope：' + esc(c.force_scope || '未设置') +
+      ' · 外网下载：' + yn(c.external_download_enabled) + '</div>';
+    const rows = (d.log || []).map(r =>
+      '<div class="diag-row"><span class="diag-ts">' + esc(r.ts || '') + '</span>' +
+      '<span class="diag-ev">' + esc(r.event || '') + '</span>' +
+      '<span class="diag-detail">' + esc(JSON.stringify(r)) + '</span></div>').join('');
+    body.innerHTML = head + '<div class="diag-list">' + (rows || '<div class="login-tip">暂无记录</div>') + '</div>';
+  } catch (e) {
+    body.innerHTML = '<div class="login-tip">加载失败：' + esc(e.message || e) + '</div>';
+  }
+}
 function showSettings() {
   const me = state.me || {};
   const body = showModal('个人资料',
@@ -1190,15 +1884,28 @@ function renderDrive() {
         (canDelete(f) ? '<button class="danger" data-del-folder="' + esc(f.id) + '" title="删除文件夹"><i class="ico i-trash"></i></button>' : '') +
       '</div></div>';
   });
+  const driveDl = (state.driveLimit[d.scope] && state.driveLimit[d.scope].download) || {};
+  const dlOK = driveDl.allowed !== false;
+  const dlTip = driveDl.tip || '当前环境已关闭下载权限';
   files.forEach(f => {
+    const pending = f.reviewStatus === 'pending';
+    const rejected = f.reviewStatus === 'rejected';
+    const canDl = dlOK && !pending && !rejected;
+    const tip = pending ? '文件待管理员审核，暂不可下载'
+      : rejected ? '文件未通过审核' : (canDl ? '点击下载：' + esc(f.name) : esc(dlTip));
     html += '<div class="drive-row">' +
-      '<div class="drive-name" data-dl="' + esc(f.id) + '" title="点击下载：' + esc(f.name) + '">' +
-        '<i class="ico i-file"></i><span>' + esc(f.name) + '</span></div>' +
+      '<div class="drive-name' + (canDl ? '' : ' dl-disabled') + '"' +
+        (canDl ? ' data-dl="' + esc(f.id) + '"' : '') + ' title="' + esc(tip) + '">' +
+        '<i class="ico i-file"></i><span>' + esc(f.name) + '</span>' +
+        (pending ? '<em class="review-tag pending">待审核</em>' : rejected ? '<em class="review-tag rejected">未通过</em>' : '') +
+        '</div>' +
       '<div class="muted">' + sizeText(f.size) + '</div>' +
       '<div class="muted drive-owner">' + esc(f.ownerNick || '') + '</div>' +
       '<div class="muted drive-time">' + fmtFull(f.mts) + '</div>' +
       '<div class="drive-actions">' +
-        '<button data-dl="' + esc(f.id) + '" title="下载"><i class="ico i-download"></i></button>' +
+        (canDl
+          ? '<button data-dl="' + esc(f.id) + '" title="下载"><i class="ico i-download"></i></button>'
+          : '<button class="dl-off" disabled title="' + esc(tip) + '"><i class="ico i-download"></i></button>') +
         (canDelete(f) ? '<button class="danger" data-del-file="' + esc(f.id) + '" title="删除"><i class="ico i-trash"></i></button>' : '') +
       '</div></div>';
   });
@@ -1225,6 +1932,11 @@ function renderDrive() {
 function downloadDriveFile(id) {
   if (!id) return;
   const d = state.drive;
+  const driveDl = (state.driveLimit[d.scope] && state.driveLimit[d.scope].download) || {};
+  if (driveDl.allowed === false) return toast(driveDl.tip || '当前环境已关闭下载权限');
+  const item = (d.files || []).find(x => x.id === id);
+  if (item && item.reviewStatus === 'pending') return toast('文件待管理员审核，暂不可下载');
+  if (item && item.reviewStatus === 'rejected') return toast('文件未通过审核');
   const url = '/api/drive/download?' + driveQuery({scope: d.scope, id: id,
     target: d.scope === 'private' ? (d.target || '') : ''});
   const a = document.createElement('a');
@@ -1489,17 +2201,23 @@ function appendSys(text) {
 function buildFileCard(f) {
   const card = document.createElement('div'); card.className = 'file-card';
   const mime = f.mime || '', url = f.url || '';
-  if (mime.startsWith('image/')) {
-    const img = document.createElement('img'); img.src = url; img.alt = f.name || '';
-    img.onclick = () => window.open(url, '_blank'); card.appendChild(img);
-  } else if (mime.startsWith('video/')) {
-    const v = document.createElement('video'); v.src = url; v.controls = true; v.preload = 'metadata'; card.appendChild(v);
-  } else if (mime.startsWith('audio/')) {
-    const a = document.createElement('audio'); a.src = url; a.controls = true; a.preload = 'metadata'; card.appendChild(a);
+  const canDl = state.download.allowed;
+  if (canDl) {
+    if (mime.startsWith('image/')) {
+      const img = document.createElement('img'); img.src = url; img.alt = f.name || '';
+      img.onclick = () => window.open(url, '_blank'); card.appendChild(img);
+    } else if (mime.startsWith('video/')) {
+      const v = document.createElement('video'); v.src = url; v.controls = true; v.preload = 'metadata'; card.appendChild(v);
+    } else if (mime.startsWith('audio/')) {
+      const a = document.createElement('audio'); a.src = url; a.controls = true; a.preload = 'metadata'; card.appendChild(a);
+    }
   }
   const line = document.createElement('div'); line.className = 'file-line';
+  const action = canDl
+    ? '<a href="' + esc(url) + '" download="' + esc(f.name) + '">下载</a>'
+    : '<span class="dl-disabled" title="' + esc(state.download.tip) + '">外网禁下载</span>';
   line.innerHTML = '<span>' + fileIcon(mime) + '</span><span class="fname" title="' + esc(f.name) + '">' + esc(f.name) + '</span>' +
-    '<span class="fsize">' + sizeText(f.size) + '</span><a href="' + esc(url) + '" download="' + esc(f.name) + '">下载</a>';
+    '<span class="fsize">' + sizeText(f.size) + '</span>' + action;
   card.appendChild(line); return card;
 }
 /* ---------- @ 群成员 ---------- */
@@ -1795,6 +2513,9 @@ async function send() {
       try {
         const info = await uploadFile(p.file, v => { prog.style.width = Math.round(v * 100) + '%'; });
         files.push(info); removePending(p.id);
+        if (info && info.reviewStatus === 'pending') {
+          toast('「' + (info.name || '文件') + '」已上传，待管理员审核后才可下载');
+        }
       } catch (e) { toast(p.file.name + '：' + e.message); }
     }
     state.sending = false; $('send').disabled = false;
@@ -1896,6 +2617,456 @@ $('input').addEventListener('paste', e => {
   const files = [];
   for (const it of items) if (it.kind === 'file') { const f = it.getAsFile(); if (f) files.push(f); }
   if (files.length) { e.preventDefault(); addFiles(files); }
+});
+
+/* ======================= 屏幕截图 / 屏幕录制 ======================= */
+function captureStamp() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return '' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) +
+         '_' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+function captureSupported() {
+  return !!(window.isSecureContext && navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+}
+function captureGuard() {
+  if (captureSupported()) return true;
+  const origin = location.protocol + '//' + location.host;
+  showModal('无法启用截图 / 录屏',
+    '<div style="line-height:1.9;font-size:13px">' +
+    '<p>浏览器只允许在安全环境下截取屏幕（HTTPS 或 localhost），当前地址：</p>' +
+    '<p><code>' + esc(location.href) + '</code></p>' +
+    '<p>解决办法（任选其一）：</p>' +
+    '<p>1. 改用 <code>http://localhost:5222</code> 或 <code>http://127.0.0.1:5222</code> 打开；<br>' +
+    '2. 给服务配置 HTTPS 后用 https 访问；<br>' +
+    '3. Chrome 打开 <code>chrome://flags/#unsafely-treat-insecure-origin-as-secure</code>，' +
+    '把 <code>' + esc(origin) + '</code> 加进白名单并重启浏览器。</p></div>',
+    [{text: '知道了', cls: 'primary', onClick: closeModal}]);
+  return false;
+}
+function downloadBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 3000);
+}
+function deliverCaptureFile(file, autoSend) {
+  addFiles([file]);
+  if (file.size > state.uploadLimit.maxBytes) return;
+  if (autoSend && state.current) setTimeout(() => { send(); }, 0);
+  else if (!state.current) toast('已加入附件，打开会话后发送');
+}
+
+/* ---------- 截图：冻结画面 / 框选 / 标注 ---------- */
+const shot = {
+  img: null, view: {x: 0, y: 0, w: 0, h: 0, scale: 1}, rect: null,
+  tool: 'select', color: '#ff3b30', actions: [], current: null, drag: null,
+};
+async function startScreenShot() {
+  if (!captureGuard()) return;
+  if (!$('shot-layer').classList.contains('hidden')) return;
+  toast('在弹窗里选「整个屏幕」，就能像 QQ 一样任意拉框');
+  let stream, video;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({video: true, audio: false});
+    video = document.createElement('video');
+    video.muted = true; video.autoplay = true; video.playsInline = true;
+    video.srcObject = stream;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('读取画面超时')), 6000);
+      video.onloadedmetadata = () => { clearTimeout(timer); resolve(); };
+      video.onerror = () => { clearTimeout(timer); reject(new Error('画面读取失败')); };
+    });
+    await video.play();
+    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+    if (!video.videoWidth || !video.videoHeight) throw new Error('画面为空');
+    const snap = document.createElement('canvas');
+    snap.width = video.videoWidth; snap.height = video.videoHeight;
+    snap.getContext('2d').drawImage(video, 0, 0, snap.width, snap.height);
+    openShotLayer(snap);
+  } catch (e) {
+    if (e && e.name !== 'NotAllowedError') toast('截图失败：' + (e.message || '未知错误'));
+  } finally {
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    if (video) video.srcObject = null;
+  }
+}
+function openShotLayer(src) {
+  const layer = $('shot-layer'), base = $('shot-base'), draw = $('shot-draw');
+  const w = window.innerWidth, h = window.innerHeight;
+  shot.img = src;
+  layer.classList.remove('hidden');
+  base.width = draw.width = w; base.height = draw.height = h;
+  const scale = Math.min(w / src.width, h / src.height);
+  const dw = src.width * scale, dh = src.height * scale;
+  shot.view = {x: (w - dw) / 2, y: (h - dh) / 2, w: dw, h: dh, scale: scale};
+  const ctx = base.getContext('2d');
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(src, shot.view.x, shot.view.y, dw, dh);
+  shot.rect = {x: shot.view.x, y: shot.view.y, w: dw, h: dh};
+  shot.actions = []; shot.current = null; shot.drag = null;
+  $('shot-text-input').classList.add('hidden');
+  setShotTool('select'); updateShotSelection(); redrawShot();
+}
+function closeShotLayer() {
+  $('shot-layer').classList.add('hidden');
+  $('shot-text-input').classList.add('hidden');
+  shot.img = null; shot.actions = []; shot.current = null; shot.drag = null;
+}
+function setShotTool(tool) {
+  shot.tool = tool;
+  $('shot-layer').dataset.tool = tool;
+  document.querySelectorAll('#shot-tools [data-tool]').forEach(b => {
+    b.classList.toggle('active', b.dataset.tool === tool);
+  });
+  if (tool !== 'text') $('shot-text-input').classList.add('hidden');
+}
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function updateShotSelection() {
+  const r = shot.rect, el = $('shot-selection');
+  if (!r) return;
+  el.style.left = r.x + 'px'; el.style.top = r.y + 'px';
+  el.style.width = r.w + 'px'; el.style.height = r.h + 'px';
+  // 选区真实像素尺寸（QQ 式实时提示），按显示缩放换算回原始画面
+  const size = $('shot-size');
+  if (size && shot.img) {
+    const k = shot.img.width / (shot.view.w || 1);
+    const wpx = Math.round(r.w * k), hpx = Math.round(r.h * k);
+    size.textContent = wpx + ' × ' + hpx;
+    size.style.top = (r.h > 26 && r.w > 76) ? '2px' : '-24px';
+  }
+}
+function shotPos(e) {
+  const box = $('shot-draw').getBoundingClientRect();
+  return {x: e.clientX - box.left, y: e.clientY - box.top};
+}
+function replayAction(ctx, a) {
+  if (!a) return;
+  ctx.save();
+  ctx.strokeStyle = a.color || '#ff3b30'; ctx.fillStyle = a.color || '#ff3b30';
+  ctx.lineWidth = a.width || 3; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  if (a.type === 'pen' && a.points && a.points.length > 1) {
+    ctx.beginPath(); ctx.moveTo(a.points[0][0], a.points[0][1]);
+    for (let i = 1; i < a.points.length; i++) ctx.lineTo(a.points[i][0], a.points[i][1]);
+    ctx.stroke();
+  } else if (a.type === 'rect') {
+    ctx.strokeRect(a.x, a.y, a.w, a.h);
+  } else if (a.type === 'text') {
+    ctx.font = 'bold 17px "Microsoft YaHei", "PingFang SC", sans-serif';
+    ctx.fillText(a.text, a.x, a.y);
+  }
+  ctx.restore();
+}
+function redrawShot(preview) {
+  const ctx = $('shot-draw').getContext('2d');
+  ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+  shot.actions.forEach(a => replayAction(ctx, a));
+  if (preview) replayAction(ctx, preview);
+}
+function cropModeAt(p) {
+  const r = shot.rect, v = shot.view, t = 8;
+  // 初始是全屏选区：此时在画面内拖动应重新框选，而不是"移动"整屏
+  if (!r) return 'new';
+  if (v && r.w >= v.w - 1 && r.h >= v.h - 1) return 'new';
+  if (Math.abs(p.x - r.x) <= t && Math.abs(p.y - r.y) <= t) return 'nw';
+  if (Math.abs(p.x - (r.x + r.w)) <= t && Math.abs(p.y - r.y) <= t) return 'ne';
+  if (Math.abs(p.x - r.x) <= t && Math.abs(p.y - (r.y + r.h)) <= t) return 'sw';
+  if (Math.abs(p.x - (r.x + r.w)) <= t && Math.abs(p.y - (r.y + r.h)) <= t) return 'se';
+  if (p.x > r.x + t && p.x < r.x + r.w - t && p.y > r.y + t && p.y < r.y + r.h - t) return 'move';
+  return 'new';
+}
+function beginShotText(p) {
+  const inp = $('shot-text-input');
+  inp.classList.remove('hidden');
+  inp.style.left = p.x + 'px'; inp.style.top = p.y + 'px';
+  inp.value = ''; inp.focus();
+  inp.onkeydown = e => {
+    e.stopPropagation();
+    if (e.key === 'Enter') {
+      const text = inp.value.trim();
+      if (text) {
+        shot.actions.push({type: 'text', text: text, x: p.x, y: p.y + 17,
+                           color: shot.color, width: 3});
+        redrawShot();
+      }
+      inp.classList.add('hidden');
+    } else if (e.key === 'Escape') {
+      inp.classList.add('hidden');
+    }
+  };
+}
+$('shot-draw').addEventListener('pointerdown', e => {
+  if (shot.img === null) return;
+  e.preventDefault();
+  const p = shotPos(e);
+  if (shot.tool === 'text') { beginShotText(p); return; }
+  if (shot.tool !== 'select') {
+    shot.current = shot.tool === 'pen'
+      ? {type: 'pen', points: [[p.x, p.y]], color: shot.color, width: 3}
+      : {type: 'rect', x: p.x, y: p.y, w: 0, h: 0, color: shot.color, width: 3};
+    shot.drag = {kind: 'draw'};
+    $('shot-draw').setPointerCapture(e.pointerId);
+    return;
+  }
+  const mode = cropModeAt(p);
+  if (mode === 'new') {
+    shot.drag = {kind: 'crop-new', start: p};
+    shot.rect = {x: p.x, y: p.y, w: 0, h: 0};
+  } else {
+    shot.drag = {kind: 'crop-' + mode, start: p, orig: Object.assign({}, shot.rect)};
+  }
+  $('shot-draw').setPointerCapture(e.pointerId);
+  updateShotSelection();
+});
+function moveShotDrag(p) {
+  if (!shot.drag) return;
+  const v = shot.view, d = shot.drag;
+  if (d.kind === 'draw' && shot.current) {
+    if (shot.current.type === 'pen') shot.current.points.push([p.x, p.y]);
+    else {
+      shot.current.w = p.x - shot.current.x;
+      shot.current.h = p.y - shot.current.y;
+    }
+    redrawShot(shot.current);
+  } else if (d.kind === 'crop-new') {
+    const x2 = clamp(p.x, v.x, v.x + v.w), y2 = clamp(p.y, v.y, v.y + v.h);
+    shot.rect = {x: Math.min(d.start.x, x2), y: Math.min(d.start.y, y2),
+                 w: Math.abs(x2 - d.start.x), h: Math.abs(y2 - d.start.y)};
+    updateShotSelection();
+  } else if (d.kind && d.kind.indexOf('crop-') === 0) {
+    const o = d.orig, dx = p.x - d.start.x, dy = p.y - d.start.y;
+    let x = o.x, y = o.y, w = o.w, h = o.h;
+    const right = v.x + v.w, bottom = v.y + v.h;
+    if (d.kind === 'crop-move') {
+      x = clamp(o.x + dx, v.x, right - o.w); y = clamp(o.y + dy, v.y, bottom - o.h);
+    } else {
+      if (d.kind.indexOf('nw') >= 0) { x = clamp(o.x + dx, v.x, o.x + o.w - 16); y = clamp(o.y + dy, v.y, o.y + o.h - 16); }
+      if (d.kind.indexOf('ne') >= 0) { w = clamp(o.w + dx, 16, right - o.x); y = clamp(o.y + dy, v.y, o.y + o.h - 16); }
+      if (d.kind.indexOf('sw') >= 0) { x = clamp(o.x + dx, v.x, o.x + o.w - 16); h = clamp(o.h + dy, 16, bottom - o.y); }
+      if (d.kind.indexOf('se') >= 0) { w = clamp(o.w + dx, 16, right - o.x); h = clamp(o.h + dy, 16, bottom - o.y); }
+    }
+    shot.rect = {x: x, y: y, w: w, h: h}; updateShotSelection();
+  }
+}
+$('shot-draw').addEventListener('pointermove', e => {
+  if (shot.drag) moveShotDrag(shotPos(e));
+});
+function endShotDrag() {
+  if (!shot.drag) return;
+  if (shot.drag.kind === 'draw' && shot.current) {
+    const a = shot.current;
+    const valid = a.type === 'pen' ? a.points.length > 1 : (Math.abs(a.w) > 2 || Math.abs(a.h) > 2);
+    if (valid) shot.actions.push(a);
+    shot.current = null; redrawShot();
+  } else if (shot.rect && (shot.rect.w < 12 || shot.rect.h < 12)) {
+    shot.rect = {x: shot.view.x, y: shot.view.y, w: shot.view.w, h: shot.view.h};
+    updateShotSelection();
+  }
+  shot.drag = null;
+}
+$('shot-draw').addEventListener('pointerup', endShotDrag);
+$('shot-draw').addEventListener('pointercancel', endShotDrag);
+// QQ 习惯：框选后双击选区直接完成
+$('shot-draw').addEventListener('dblclick', e => {
+  if (shot.img === null || shot.tool !== 'select') return;
+  const p = shotPos(e), r = shot.rect;
+  if (r && p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h) {
+    $('shot-send').click();
+  }
+});
+function onShotHandleMove(e) {
+  if (!shot.drag) return;
+  moveShotDrag(shotPos(e));
+}
+function onShotHandleUp() {
+  endShotDrag();
+  window.removeEventListener('pointermove', onShotHandleMove);
+  window.removeEventListener('pointerup', onShotHandleUp);
+  window.removeEventListener('pointercancel', onShotHandleUp);
+}
+document.querySelectorAll('#shot-selection .sh').forEach(h => {
+  h.addEventListener('pointerdown', e => {
+    if (!shot.rect) return;
+    e.preventDefault(); e.stopPropagation();
+    const dir = h.className.replace('sh sh-', '').trim();
+    shot.drag = {kind: 'crop-' + dir, start: shotPos(e),
+                 orig: Object.assign({}, shot.rect)};
+    window.addEventListener('pointermove', onShotHandleMove);
+    window.addEventListener('pointerup', onShotHandleUp);
+    window.addEventListener('pointercancel', onShotHandleUp);
+  });
+});
+function makeShotBlob(cb) {
+  if (!shot.img || !shot.rect || shot.rect.w < 8 || shot.rect.h < 8) return toast('请先框选截图区域');
+  const r = shot.rect, v = shot.view;
+  const scale = shot.img.width / v.w;
+  const sx = (r.x - v.x) * scale, sy = (r.y - v.y) * scale;
+  const sw = r.w * scale, sh = r.h * scale;
+  const out = document.createElement('canvas');
+  out.width = Math.max(1, Math.round(sw)); out.height = Math.max(1, Math.round(sh));
+  const ctx = out.getContext('2d');
+  ctx.drawImage(shot.img, sx, sy, sw, sh, 0, 0, out.width, out.height);
+  ctx.save();
+  ctx.scale(out.width / $('shot-draw').width, out.height / $('shot-draw').height);
+  ctx.translate(-r.x, -r.y);
+  shot.actions.forEach(a => replayAction(ctx, a));
+  ctx.restore();
+  out.toBlob(blob => {
+    if (!blob) return toast('截图生成失败');
+    const file = new File([blob], '截图_' + captureStamp() + '.png',
+                          {type: 'image/png', lastModified: Date.now()});
+    cb(file, blob);
+  }, 'image/png');
+}
+document.querySelectorAll('#shot-tools [data-tool]').forEach(b => {
+  b.onclick = () => setShotTool(b.dataset.tool);
+});
+$('shot-color').oninput = e => { shot.color = e.target.value; };
+$('shot-undo').onclick = () => { shot.actions.pop(); redrawShot(); };
+$('shot-clear').onclick = () => { shot.actions = []; redrawShot(); };
+$('shot-cancel').onclick = closeShotLayer;
+$('shot-reselect').onclick = () => { closeShotLayer(); startScreenShot(); };
+$('shot-send').onclick = () => {
+  makeShotBlob((file) => { closeShotLayer(); deliverCaptureFile(file, true); });
+};
+$('shot-save').onclick = () => {
+  makeShotBlob((file, blob) => { downloadBlob(blob, file.name); toast('截图已保存到本地'); });
+};
+$('shot-copy').onclick = () => {
+  if (!navigator.clipboard || !window.ClipboardItem) return toast('当前浏览器不支持复制图片，请使用「另存」');
+  makeShotBlob((file, blob) => {
+    navigator.clipboard.write([new ClipboardItem({'image/png': blob})])
+      .then(() => { closeShotLayer(); toast('截图已复制到剪贴板'); })
+      .catch(() => toast('复制失败，请使用「另存」'));
+  });
+};
+
+/* ---------- 录屏：MediaRecorder + 浮动预览 ---------- */
+const rec = {stream: null, recorder: null, chunks: [], startedAt: 0, pausedAt: 0,
+             pausedTotal: 0, timer: null, cancel: false};
+function updateRecStatus() {
+  if (!rec.startedAt) return;
+  const end = rec.pausedAt || Date.now();
+  const sec = Math.floor((end - rec.startedAt - rec.pausedTotal) / 1000);
+  const p = n => String(n).padStart(2, '0');
+  $('rec-time').textContent = p(Math.floor(sec / 60)) + ':' + p(sec % 60);
+  const size = rec.chunks.reduce((s, c) => s + c.size, 0);
+  $('rec-size').textContent = (rec.pausedAt ? '已暂停 · ' : '录制中 · ') + sizeText(size);
+}
+function resetRecState() {
+  clearInterval(rec.timer);
+  const preview = $('rec-preview');
+  if (preview.srcObject) { preview.srcObject.getTracks().forEach(t => t.stop()); preview.srcObject = null; }
+  $('rec-bar').classList.add('hidden', 'paused');
+  if (rec.recorder && rec.recorder.state !== 'inactive') {
+    rec.cancel = true;
+    try { rec.recorder.stop(); } catch (e) {}
+  }
+  if (rec.stream) rec.stream.getTracks().forEach(t => t.stop());
+  rec.stream = null; rec.recorder = null; rec.chunks = [];
+  rec.startedAt = 0; rec.pausedAt = 0; rec.pausedTotal = 0; rec.cancel = false;
+}
+async function startScreenRecord() {
+  if (!captureGuard()) return;
+  if (rec.recorder) return toast('已经在录制中');
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getDisplayMedia({
+      video: {frameRate: {ideal: 15}}, audio: true
+    });
+  } catch (e) {
+    if (e && e.name !== 'NotAllowedError') toast('录屏失败：' + (e.message || '未知错误'));
+    return;
+  }
+  const mime = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus',
+                'video/webm;codecs=vp9', 'video/webm']
+    .find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m));
+  if (!mime) {
+    stream.getTracks().forEach(t => t.stop());
+    return toast('当前浏览器不支持录制 WebM 视频');
+  }
+  let recorder;
+  try {
+    recorder = new MediaRecorder(stream, {
+      mimeType: mime, videoBitsPerSecond: 1500000, audioBitsPerSecond: 96000
+    });
+  } catch (e) {
+    stream.getTracks().forEach(t => t.stop());
+    return toast('录屏初始化失败：' + (e.message || '未知错误'));
+  }
+  rec.stream = stream; rec.recorder = recorder; rec.chunks = [];
+  rec.startedAt = Date.now(); rec.pausedAt = 0; rec.pausedTotal = 0; rec.cancel = false;
+  recorder.ondataavailable = e => { if (e.data && e.data.size) rec.chunks.push(e.data); };
+  recorder.onstop = finishScreenRecord;
+  recorder.onerror = () => { toast('录制出错，已中止'); resetRecState(); };
+  const vt = stream.getVideoTracks()[0];
+  if (vt) vt.addEventListener('ended', () => {
+    if (rec.recorder && rec.recorder.state !== 'inactive') stopScreenRecord(false);
+  });
+  recorder.start(1000);
+  $('rec-bar').classList.remove('hidden', 'paused');
+  $('rec-preview').srcObject = stream;
+  $('rec-pause').textContent = '暂停';
+  $('rec-time').textContent = '00:00';
+  $('rec-size').textContent = '录制中';
+  clearInterval(rec.timer);
+  rec.timer = setInterval(updateRecStatus, 500);
+  toast('已开始录屏 · 点浏览器「停止共享」也可结束');
+}
+function stopScreenRecord(cancel) {
+  if (!rec.recorder) return;
+  rec.cancel = !!cancel;
+  if (rec.recorder.state !== 'inactive') {
+    try { rec.recorder.stop(); } catch (e) { resetRecState(); }
+  } else resetRecState();
+}
+function finishScreenRecord() {
+  clearInterval(rec.timer);
+  const preview = $('rec-preview');
+  if (preview.srcObject) {
+    preview.srcObject.getTracks().forEach(t => t.stop());
+    preview.srcObject = null;
+  }
+  $('rec-bar').classList.add('hidden', 'paused');
+  const cancel = rec.cancel, chunks = rec.chunks.slice();
+  rec.stream = null; rec.recorder = null; rec.chunks = [];
+  rec.startedAt = 0; rec.pausedAt = 0; rec.pausedTotal = 0; rec.cancel = false;
+  if (cancel || !chunks.length) return;
+  const blob = new Blob(chunks, {type: 'video/webm'});
+  const file = new File([blob], '录屏_' + captureStamp() + '.webm',
+                        {type: 'video/webm', lastModified: Date.now()});
+  if (blob.size > state.uploadLimit.maxBytes) {
+    downloadBlob(blob, file.name);
+    toast('录屏 ' + sizeText(blob.size) + ' 超过上传上限 ' + state.uploadLimit.text + '，已保存到本地');
+    return;
+  }
+  addFiles([file]);
+  if (state.current) { toast('录屏已发送'); setTimeout(() => { send(); }, 0); }
+  else toast('录屏已加入附件，打开会话后发送');
+}
+$('rec-pause').onclick = () => {
+  if (!rec.recorder) return;
+  if (rec.recorder.state === 'recording') {
+    rec.recorder.pause(); rec.pausedAt = Date.now();
+    $('rec-pause').textContent = '继续'; $('rec-bar').classList.add('paused');
+  } else if (rec.recorder.state === 'paused' && rec.pausedAt) {
+    rec.pausedTotal += Date.now() - rec.pausedAt; rec.pausedAt = 0;
+    rec.recorder.resume();
+    $('rec-pause').textContent = '暂停'; $('rec-bar').classList.remove('paused');
+  }
+  updateRecStatus();
+};
+$('rec-stop').onclick = () => stopScreenRecord(false);
+$('rec-cancel').onclick = () => stopScreenRecord(true);
+$('shot-btn').onclick = startScreenShot;
+$('rec-btn').onclick = startScreenRecord;
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('shot-layer').classList.contains('hidden')) {
+    closeShotLayer(); return;
+  }
+  if (!e.ctrlKey || !e.altKey || e.shiftKey || e.metaKey) return;
+  const k = (e.key || '').toLowerCase();
+  if (k === 'a') { e.preventDefault(); startScreenShot(); }
+  else if (k === 's') { e.preventDefault(); startScreenRecord(); }
 });
 
 /* ======================= 启动 ======================= */
